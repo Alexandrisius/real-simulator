@@ -37,6 +37,11 @@ interface RequestRow extends ToolRequest {
 /** Запасные пресеты мест, если реестр мест пуст (основной источник — /api/places). */
 const PLACE_PRESETS = ["дом", "улица", "кафе", "отель", "пляж"];
 
+/** Пресеты паузы между ходами агентов (мс) — регулятор «вайба» в шапке. */
+const DELAY_PRESETS = [0, 1000, 2000, 5000, 10000, 15000, 30000];
+
+const delayLabel = (ms: number) => (ms === 0 ? "пауза: выкл" : `пауза: ${ms / 1000} с`);
+
 const placeOptionsOf = (places: Place[]) =>
   places.length > 0
     ? places.map((p) => ({ value: p.name, label: p.name }))
@@ -109,7 +114,7 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
   const [settingsForm, setSettingsForm] = useState({
     setting: "",
     rulesExtra: "",
-    turnDelayMs: 1500,
+    turnDelayMs: 5000,
     contextEvents: 60,
     pauseForHumans: false,
     maxApiCallsPerScene: 300,
@@ -726,6 +731,22 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
   const { scene, participants, runtime } = data;
   const nextChar = runtime.nextCharacterId != null ? charById.get(runtime.nextCharacterId) : null;
 
+  const curDelay = scene.config.turnDelayMs ?? 5000;
+  const delayOptions = [
+    ...(!DELAY_PRESETS.includes(curDelay)
+      ? [{ value: String(curDelay), label: `${delayLabel(curDelay)} (свой)` }]
+      : []),
+    ...DELAY_PRESETS.map((ms) => ({ value: String(ms), label: delayLabel(ms) })),
+  ];
+  const setDelay = async (ms: number) => {
+    try {
+      await apiPatch(`/api/scenes/${sid}`, { config: { turnDelayMs: ms } });
+      loadScene();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
   return (
     <div className="flex h-screen flex-col">
       {/* Шапка */}
@@ -752,6 +773,17 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
           </div>
         </div>
         <div className="ml-auto flex items-center gap-2">
+          <div
+            className="w-40 shrink-0"
+            title="Пауза между ходами агентов — применяется со следующего хода, можно менять на лету"
+          >
+            <Dropdown
+              size="md"
+              value={String(curDelay)}
+              options={delayOptions}
+              onChange={(v) => setDelay(Number(v))}
+            />
+          </div>
           {runtime.status !== "running" && (
             <Btn
               onClick={restartDialogue}

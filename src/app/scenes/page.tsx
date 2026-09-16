@@ -44,7 +44,7 @@ export default function ScenesPage() {
   const [selected, setSelected] = useState<number[]>([]);
   const [schemasBy, setSchemasBy] = useState<Record<string, number | null>>({});
   const [goalsBy, setGoalsBy] = useState<Record<string, string>>({});
-  const [turnDelayMs, setTurnDelayMs] = useState(1500);
+  const [turnDelayMs, setTurnDelayMs] = useState(5000);
   const [maxTurns, setMaxTurns] = useState(0);
   const [maxIterPerTurn, setMaxIterPerTurn] = useState(3);
   const [contextEvents, setContextEvents] = useState(60);

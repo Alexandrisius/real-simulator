@@ -339,7 +339,7 @@ export class Engine {
         return;
       }
 
-      const delay = getScene(sceneId)?.config.turnDelayMs ?? 1500;
+      const delay = getScene(sceneId)?.config.turnDelayMs ?? 5000;
       await this.sleep(delay, run);
     }
   }

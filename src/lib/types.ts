@@ -403,7 +403,7 @@ export interface SceneConfig {
 }
 
 export const DEFAULT_SCENE_CONFIG: SceneConfig = {
-  turnDelayMs: 1500,
+  turnDelayMs: 5000,
   maxTurns: 0,
   maxIterPerTurn: 3,
   contextEvents: 60,
