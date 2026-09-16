@@ -1,0 +1,113 @@
+@import "tailwindcss";
+
+@theme {
+  --color-bg: #09090f;
+  --color-panel: #10101a;
+  --color-panel-2: #161622;
+  --color-line: #242433;
+  --color-line-2: #32324a;
+  --color-panel-3: #1b1b2a;
+  --color-fg: #e8e8f2;
+  --color-muted: #8f8fa6;
+  --color-accent: #8b5cf6;
+  --color-accent-2: #6366f1;
+  --color-ok: #34d399;
+  --color-warn: #fbbf24;
+  --color-err: #fb7185;
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+}
+
+html,
+body {
+  height: 100%;
+}
+
+/* Нативные виджеты (скроллбары, слайдеры и пр.) рисуются в тёмной теме,
+   а не светлым попапом поверх интерфейса */
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background:
+    radial-gradient(1200px 600px at 80% -10%, rgba(139, 92, 246, 0.07), transparent 60%),
+    radial-gradient(900px 500px at -10% 110%, rgba(99, 102, 241, 0.05), transparent 60%),
+    var(--color-bg);
+  color: var(--color-fg);
+  font-family: var(--font-sans);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2c2c3d transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: #2c2c3d;
+  border-radius: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::selection {
+  background: rgba(139, 92, 246, 0.35);
+}
+
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.anim-in {
+  animation: fade-in-up 0.18s ease-out both;
+}
+
+@keyframes pulse-dot {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+.pulse-dot {
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+
+/* Канвас флоу (@xyflow/react): тёмная тема под палитру приложения */
+.react-flow {
+  --xy-background-color: transparent;
+  --xy-edge-stroke: #32324a;
+  --xy-edge-stroke-selected: #8b5cf6;
+  --xy-handle-background-color: #8b5cf6;
+  --xy-handle-border-color: #10101a;
+  --xy-minimap-background-color: #10101a;
+  --xy-controls-button-background-color: #161622;
+  --xy-controls-button-background-color-hover: #1b1b2a;
+  --xy-controls-button-color: #8f8fa6;
+  --xy-controls-button-color-hover: #e8e8f2;
+  --xy-controls-button-border-color: #242433;
+  --xy-attribution-background-color: transparent;
+}
+.react-flow__edge-text {
+  fill: #8f8fa6;
+  font-size: 10px;
+}
+.react-flow__edge-textbg {
+  fill: #10101a;
+}
+.react-flow__handle {
+  width: 8px;
+  height: 8px;
+}

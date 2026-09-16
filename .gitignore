@@ -1,0 +1,10 @@
+node_modules/
+.next/
+out/
+data/
+release/
+*.log
+.env
+.env.local
+tsconfig.tsbuildinfo
+next-env.d.ts
