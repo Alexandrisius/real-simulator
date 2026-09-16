@@ -60,6 +60,10 @@ assembly, or scoring.
   publish or commit. `data/app.db` is the user's live database (created on
   first start); e2e and test stands use their own DB files
   (`e2e-test.db`, `clean.db`, legacy `smoke.db` — archives, never delete).
+- `.agents/skills/real-simulator-guide/` — operating skill for AI agents:
+  how to help the user create characters, scenes, tools, flows, debug runs;
+  REST examples in `references/`. Load it when the task is *using* the app
+  rather than changing it.
 
 ## How a scene runs
 
