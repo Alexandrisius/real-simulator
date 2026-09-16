@@ -5,6 +5,21 @@ import type { DB } from "./index";
 
 export function seedDefaultTools(db: DB): void {
   db.exec(`CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)`);
+  // Сид — под эксклюзивной транзакцией: один БД могут одновременно открыть
+  // несколько процессов (воркеры next build), и проверка флагов «уже сеяно»
+  // должна быть атомарной, иначе гонка даёт UNIQUE-ошибки и двойные сиды.
+  // Второй процесс просто дождётся COMMIT (busy_timeout) и выйдет по флагам.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    runSeeds(db);
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+}
+
+function runSeeds(db: DB): void {
   // Товары магазина и атрибуты сеются под своими флагами — чтобы добавиться
   // и в уже существующие базы (ранний return ниже старые базы не пропускает).
   seedProducts(db);
