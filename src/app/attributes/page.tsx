@@ -543,7 +543,7 @@ export default function AttributesPage() {
       )}
 
       {/* ---- Места (реестр для go_to/invite) ---- */}
-      <Card className="mb-6 p-5">
+      <Card className="mt-10 mb-6 p-5">
         <div className="mb-3 flex items-center gap-2">
           <MapPin className="h-5 w-5 text-accent" /> Места
           <Badge color="accent">тулы go_to / invite у агентов</Badge>

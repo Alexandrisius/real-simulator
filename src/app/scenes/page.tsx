@@ -18,12 +18,21 @@ import {
 } from "@/components/ui";
 import { Dropdown } from "@/components/Dropdown";
 import { api, apiDelete, apiPost } from "@/components/api";
-import type { Character, Scene, SceneConfig, ValidationSchema } from "@/lib/types";
+import type { Character, Place, Scene, SceneConfig, ValidationSchema } from "@/lib/types";
+
+/** Запасные пресеты мест, если реестр мест пуст (основной источник — /api/places). */
+const PLACE_PRESETS = ["дом", "улица", "кафе", "отель", "пляж"];
+
+const placeOptionsOf = (places: Place[]) =>
+  places.length > 0
+    ? places.map((p) => ({ value: p.name, label: p.name }))
+    : PLACE_PRESETS.map((p) => ({ value: p, label: p }));
 
 export default function ScenesPage() {
   const [scenes, setScenes] = useState<Scene[]>([]);
   const [chars, setChars] = useState<Character[]>([]);
   const [schemas, setSchemas] = useState<ValidationSchema[]>([]);
+  const [places, setPlaces] = useState<Place[]>([]);
   const [error, setError] = useState("");
   const [creating, setCreating] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -31,6 +40,7 @@ export default function ScenesPage() {
 
   const [name, setName] = useState("");
   const [setting, setSetting] = useState("");
+  const [place, setPlace] = useState("");
   const [selected, setSelected] = useState<number[]>([]);
   const [schemasBy, setSchemasBy] = useState<Record<string, number | null>>({});
   const [goalsBy, setGoalsBy] = useState<Record<string, string>>({});
@@ -41,16 +51,20 @@ export default function ScenesPage() {
   const [rulesExtra, setRulesExtra] = useState("");
   const [pauseForHumans, setPauseForHumans] = useState(false);
 
+  const placeOptions = placeOptionsOf(places);
+
   const load = useCallback(() => {
     Promise.all([
       api<Scene[]>("/api/scenes"),
       api<Character[]>("/api/characters"),
       api<ValidationSchema[]>("/api/schemas"),
+      api<Place[]>("/api/places"),
     ])
-      .then(([s, c, v]) => {
+      .then(([s, c, v, p]) => {
         setScenes(s);
         setChars(c);
         setSchemas(v);
+        setPlaces(p);
       })
       .catch((e) => setError(e.message));
   }, []);
@@ -92,6 +106,7 @@ export default function ScenesPage() {
       contextEvents,
       rulesExtra,
       pauseForHumans,
+      place,
     };
     try {
       const s = await apiPost<Scene>("/api/scenes", {
@@ -143,7 +158,24 @@ export default function ScenesPage() {
             <Field label="Название">
               <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Вечер пятницы" />
             </Field>
-            <Field label="Обстановка сцены" hint="Контекст для всех персонажей: время, место, обстоятельства">
+            <Field label="Место действия" hint="окружение: влияет на границы и одежду; реестр — в разделе «Характеристики»">
+              <div className="flex gap-2">
+                <Input
+                  value={place}
+                  onChange={(e) => setPlace(e.target.value)}
+                  placeholder="дом, улица, кафе…"
+                />
+                <div className="w-36 shrink-0">
+                  <Dropdown
+                    value={placeOptions.some((o) => o.value === place) ? place : ""}
+                    options={placeOptions}
+                    onChange={(v) => setPlace(v)}
+                    title="Места из реестра"
+                  />
+                </div>
+              </div>
+            </Field>
+            <Field label="Обстановка сцены" hint="Контекст для всех персонажей: время, обстоятельства" className="sm:col-span-2">
               <Input
                 value={setting}
                 onChange={(e) => setSetting(e.target.value)}
