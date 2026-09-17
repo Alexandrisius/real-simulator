@@ -15,6 +15,16 @@ export function resolveDbPath(): string {
 
 function createDb(): DB {
   const dbPath = resolveDbPath();
+  // standalone-сборка меняет рабочий каталог: БД молча создаётся в копии
+  // data/ внутри .next и «съедает» правки (данные «пропадают» после пересборки).
+  // Прод запускается только start.bat из корня — здесь это всегда ошибка окружения.
+  if (dbPath.includes(`${path.sep}.next${path.sep}`)) {
+    console.warn(
+      "\n⚠️  БД открывается внутри сборки (.next) — это копия, а не живая база!\n" +
+        "   Прод запускается только `start.bat` из корня репозитория; никогда\n" +
+        "   `node .next/standalone/server.js` (данные уйдут в копию и потеряются).\n"
+    );
+  }
   mkdirSync(path.dirname(dbPath), { recursive: true });
   const db = new DatabaseSync(dbPath);
   db.exec("PRAGMA journal_mode = WAL;");
@@ -64,6 +74,8 @@ export function ensureSchema(db: DB): void {
       state TEXT NOT NULL DEFAULT '{}',
       is_human INTEGER NOT NULL DEFAULT 0,
       boundaries TEXT NOT NULL DEFAULT '[]',
+      fallback_provider_id INTEGER REFERENCES providers(id),
+      fallback_model TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL
     );
 
@@ -281,6 +293,60 @@ export function ensureSchema(db: DB): void {
       left_at TEXT
     );
     CREATE INDEX IF NOT EXISTS idx_flowvisits_run ON flow_run_visits(run_id, id);
+
+    CREATE TABLE IF NOT EXISTS offers (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      scene_id INTEGER NOT NULL REFERENCES scenes(id) ON DELETE CASCADE,
+      from_id INTEGER NOT NULL,
+      to_id INTEGER NOT NULL,
+      tool_name TEXT NOT NULL,
+      args TEXT NOT NULL DEFAULT '{}',
+      status TEXT NOT NULL DEFAULT 'pending',
+      comment TEXT NULL,
+      turn INTEGER NOT NULL DEFAULT 0,
+      expires_turn INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      decided_at TEXT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_offers_scene ON offers(scene_id, id);
+
+    CREATE TABLE IF NOT EXISTS scene_blocks (
+      scene_id INTEGER NOT NULL REFERENCES scenes(id) ON DELETE CASCADE,
+      blocker_id INTEGER NOT NULL,
+      blocked_id INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (scene_id, blocker_id, blocked_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS garments (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      emoji TEXT NOT NULL DEFAULT '👕',
+      description TEXT NOT NULL DEFAULT '',
+      slot TEXT NOT NULL DEFAULT '',
+      effects TEXT NOT NULL DEFAULT '[]',
+      price REAL NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS character_garments (
+      character_id INTEGER NOT NULL REFERENCES characters(id) ON DELETE CASCADE,
+      garment_id INTEGER NOT NULL REFERENCES garments(id) ON DELETE CASCADE,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (character_id, garment_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS combos (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      name TEXT NOT NULL UNIQUE,
+      title TEXT NOT NULL,
+      description TEXT NOT NULL DEFAULT '',
+      steps TEXT NOT NULL DEFAULT '[]',
+      window_turns INTEGER NOT NULL DEFAULT 10,
+      effects TEXT NOT NULL DEFAULT '[]',
+      knowers TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL
+    );
   `);
   migrateCharacters(db);
   migrateScenes(db);
@@ -288,6 +354,18 @@ export function ensureSchema(db: DB): void {
   migrateTools(db);
   migrateProducts(db);
   migrateAttributes(db);
+  migrateClothingSlots(db);
+  migrateCombos(db);
+}
+
+/** Миграция старых баз: анонс срабатывания комбо («достижение» всем участникам). */
+function migrateCombos(db: DB): void {
+  const cols = db.prepare("PRAGMA table_info(combos)").all() as unknown as {
+    name: string;
+  }[];
+  if (!cols.some((c) => c.name === "announce")) {
+    db.exec("ALTER TABLE combos ADD COLUMN announce INTEGER NOT NULL DEFAULT 1");
+  }
 }
 
 /** Миграция старых баз: публичность/штраф лжи/прикрытие одеждой у характеристик. */
@@ -339,6 +417,23 @@ function migrateTools(db: DB): void {
   if (!cols.some((c) => c.name === "outcomes")) {
     db.exec("ALTER TABLE tools ADD COLUMN outcomes TEXT NOT NULL DEFAULT '[]'");
   }
+  // Согласие на адресный тул + эффекты при отказе (механика предложений)
+  if (!cols.some((c) => c.name === "requires_consent")) {
+    db.exec("ALTER TABLE tools ADD COLUMN requires_consent INTEGER NOT NULL DEFAULT 0");
+  }
+  if (!cols.some((c) => c.name === "decline_effects")) {
+    db.exec("ALTER TABLE tools ADD COLUMN decline_effects TEXT NOT NULL DEFAULT '[]'");
+  }
+}
+
+/** Миграция старых баз: эффекты пустого слота одежды (bareEffects). */
+function migrateClothingSlots(db: DB): void {
+  const cols = db.prepare("PRAGMA table_info(clothing_slots)").all() as unknown as {
+    name: string;
+  }[];
+  if (!cols.some((c) => c.name === "bare_effects")) {
+    db.exec("ALTER TABLE clothing_slots ADD COLUMN bare_effects TEXT NOT NULL DEFAULT '[]'");
+  }
 }
 
 /** Миграция старых баз: привязка схемы валидации + цель участника сцены. */
@@ -356,6 +451,10 @@ function migrateSceneCharacters(db: DB): void {
   }
   if (!cols.some((c) => c.name === "initial_state")) {
     db.exec("ALTER TABLE scene_characters ADD COLUMN initial_state TEXT");
+  }
+  if (!cols.some((c) => c.name === "left_scene")) {
+    // Ушёл из сцены (leave_scene): из ротации исчезает навсегда, до пересбора состава
+    db.exec("ALTER TABLE scene_characters ADD COLUMN left_scene INTEGER NOT NULL DEFAULT 0");
   }
 }
 
@@ -382,6 +481,15 @@ function migrateCharacters(db: DB): void {
   }
   if (!cols.some((c) => c.name === "boundaries")) {
     db.exec("ALTER TABLE characters ADD COLUMN boundaries TEXT NOT NULL DEFAULT '[]'");
+  }
+  // Страховочная модель: провайдер+модель, подхватывающая ход при отказе/обрыве основной
+  if (!cols.some((c) => c.name === "fallback_provider_id")) {
+    db.exec(
+      "ALTER TABLE characters ADD COLUMN fallback_provider_id INTEGER REFERENCES providers(id)"
+    );
+  }
+  if (!cols.some((c) => c.name === "fallback_model")) {
+    db.exec("ALTER TABLE characters ADD COLUMN fallback_model TEXT NOT NULL DEFAULT ''");
   }
   if (cols.some((c) => c.name === "is_human")) return;
   // FK приходится гасить: DROP TABLE characters не пройдёт,

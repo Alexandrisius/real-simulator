@@ -26,7 +26,7 @@ import {
 import { Badge, Btn, Card, ErrorText, Field, IconBtn, Input, StatusBadge, Textarea } from "@/components/ui";
 import { Dropdown } from "@/components/Dropdown";
 import { api, apiPatch, apiPost } from "@/components/api";
-import type { Audience, AttributeDef, Character, ClothingSlot, Place, Scene, SimEvent, SceneStatus, StreamMessage, ApiLog, Tool, CharacterScore, ToolRequest, ShopProduct } from "@/lib/types";
+import type { Audience, AttributeDef, Character, ClothingSlot, FinishCondition, Place, Scene, SimEvent, SceneStatus, StreamMessage, ApiLog, Tool, CharacterScore, ToolRequest, ShopProduct } from "@/lib/types";
 
 interface RequestRow extends ToolRequest {
   characterName: string;
@@ -34,18 +34,37 @@ interface RequestRow extends ToolRequest {
   sceneName: string;
 }
 
-/** Запасные пресеты мест, если реестр мест пуст (основной источник — /api/places). */
-const PLACE_PRESETS = ["дом", "улица", "кафе", "отель", "пляж"];
-
 /** Пресеты паузы между ходами агентов (мс) — регулятор «вайба» в шапке. */
 const DELAY_PRESETS = [0, 1000, 2000, 5000, 10000, 15000, 30000];
 
 const delayLabel = (ms: number) => (ms === 0 ? "пауза: выкл" : `пауза: ${ms / 1000} с`);
 
-const placeOptionsOf = (places: Place[]) =>
-  places.length > 0
-    ? places.map((p) => ({ value: p.name, label: p.name }))
-    : PLACE_PRESETS.map((p) => ({ value: p, label: p }));
+/** Варианты места действия: только реестр мест (/api/places) плюс «не задано». */
+const placeOptionsOf = (places: Place[]) => [
+  { value: "", label: "— не задано —" },
+  ...places.map((p) => ({ value: p.name, label: p.name })),
+];
+
+/** Заготовка условия авто-финиша выбранного типа (привязка к персонажу сохраняется). */
+function makeCondition(type: FinishCondition["type"], characterId?: number): FinishCondition {
+  const base: FinishCondition =
+    type === "toolCall"
+      ? { type, toolName: "" }
+      : type === "outcome"
+        ? { type, toolName: "", outcomeId: "" }
+        : { type, key: "", op: ">=", value: 0 };
+  return characterId == null ? base : { ...base, characterId };
+}
+
+/** Правка условия авто-финиша: поля со значением undefined удаляются (напр. characterId). */
+function patchCondition(c: FinishCondition, patch: Record<string, unknown>): FinishCondition {
+  const next = { ...c } as Record<string, unknown>;
+  for (const [k, v] of Object.entries(patch)) {
+    if (v === undefined) delete next[k];
+    else next[k] = v;
+  }
+  return next as FinishCondition;
+}
 
 const PALETTE = [
   "text-violet-300",
@@ -86,6 +105,16 @@ function fmtTime(iso: string): string {
   }
 }
 
+/** Видимость события персонажу (зеркало серверной модели): свои события, публичные
+ *  и адресованные ему; чужие speech-события — мысли, их не слышит никто, кроме автора. */
+function visibleForCharacter(ev: SimEvent, cid: number): boolean {
+  if (ev.type === "speech") return ev.actorId === cid;
+  if (ev.actorId === cid) return true;
+  if (ev.audience === "all") return true;
+  if (ev.audience === "none") return false;
+  return Array.isArray(ev.audience) && ev.audience.includes(cid);
+}
+
 export default function SceneRoomPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const sid = Number(id);
@@ -99,6 +128,8 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
   const [directorTarget, setDirectorTarget] = useState<string>("all");
   /** Режим ввода: "director" | id персонажа */
   const [mode, setMode] = useState<string>("director");
+  /** Чья лента: "architect" (всё, без фильтра) | id персонажа (его видимость). */
+  const [feedView, setFeedView] = useState<string>("architect");
   const [tools, setTools] = useState<Tool[]>([]);
   const [showActions, setShowActions] = useState(false);
   const [actionToolId, setActionToolId] = useState<number | null>(null);
@@ -120,10 +151,15 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
     maxApiCallsPerScene: 300,
     maxTokensPerScene: 1000000,
     allowToolRequests: false,
+    allowAgentStops: true,
     place: "",
   });
   const [goalDrafts, setGoalDrafts] = useState<Record<string, string>>({});
   const [settingsSaved, setSettingsSaved] = useState(false);
+  /** Черновик авто-финиша: включён ли, условия («И») и сколько ходов доигрывать после. */
+  const [finishOn, setFinishOn] = useState(false);
+  const [finishConditions, setFinishConditions] = useState<FinishCondition[]>([]);
+  const [finishDelay, setFinishDelay] = useState(2);
   const [showRequests, setShowRequests] = useState(false);
   const [requests, setRequests] = useState<RequestRow[] | null>(null);
   const [requestReason, setRequestReason] = useState("");
@@ -173,8 +209,12 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
         maxApiCallsPerScene: d.scene.config.maxApiCallsPerScene ?? 300,
         maxTokensPerScene: d.scene.config.maxTokensPerScene ?? 1000000,
         allowToolRequests: d.scene.config.allowToolRequests ?? false,
+        allowAgentStops: d.scene.config.allowAgentStops ?? true,
         place: d.scene.config.place ?? "",
       });
+      setFinishOn(d.scene.config.finish != null);
+      setFinishConditions(d.scene.config.finish?.conditions ?? []);
+      setFinishDelay(d.scene.config.finish?.delayTurns ?? 2);
       setGoalDrafts(
         Object.fromEntries(d.participants.map((p) => [String(p.id), p.goal ?? ""]))
       );
@@ -278,7 +318,7 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
     if (stickRef.current && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [events]);
+  }, [events, feedView]);
 
   const onScroll = () => {
     const el = scrollRef.current;
@@ -351,10 +391,15 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
   const [hasHiddenAttrs, setHasHiddenAttrs] = useState(false);
   const [hasClothing, setHasClothing] = useState(false);
   const [places, setPlaces] = useState<Place[]>([]);
+  /** Реестр характеристик — для выбора ключа в условиях авто-финиша. */
+  const [attrs, setAttrs] = useState<AttributeDef[]>([]);
   useEffect(() => {
     api<ShopProduct[]>("/api/products").then(setProducts).catch(() => {});
     api<AttributeDef[]>("/api/attributes")
-      .then((attrs) => setHasHiddenAttrs(attrs.some((a) => a.visibility === "hidden")))
+      .then((list) => {
+        setAttrs(list);
+        setHasHiddenAttrs(list.some((a) => a.visibility === "hidden"));
+      })
       .catch(() => {});
     api<ClothingSlot[]>("/api/clothing-slots")
       .then((slots) => setHasClothing(slots.length > 0))
@@ -362,6 +407,19 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
     api<Place[]>("/api/places").then(setPlaces).catch(() => {});
   }, []);
   const placeOptions = placeOptionsOf(places);
+  // Сохранённое место вне реестра показываем отдельным вариантом, чтобы не терять значение.
+  const settingsPlaceOptions =
+    settingsForm.place && !placeOptions.some((o) => o.value === settingsForm.place)
+      ? [
+          ...placeOptions,
+          { value: settingsForm.place, label: `${settingsForm.place} (нет в реестре)` },
+        ]
+      : placeOptions;
+  /** Инструменты для условий авто-финиша (выбор по имени из реестра тулов). */
+  const toolOptions = tools.map((t) => ({
+    value: t.name,
+    label: t.title ? `${t.title} · ${t.name}` : t.name,
+  }));
 
   // Псевдотулы магазина: доступны всем, в БД не хранятся (исполняет движок).
   const shopPseudoTools: Tool[] =
@@ -544,6 +602,184 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
     );
   }
 
+  // Стоп-инструменты агентов: выдаются, когда в сцене включены allowAgentStops.
+  if (data?.scene.config.allowAgentStops ?? true) {
+    virtualPseudoTools.push(
+      {
+        id: -8,
+        name: "respond_to_offer",
+        title: "Ответить на предложение",
+        description:
+          "Принять (accept) или отклонить (decline) адресованное вам предложение — с ответными словами или без.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            offer: { type: "string", description: "id предложения, напр. 3" },
+            decision: { type: "string", description: "accept или decline" },
+            words: { type: "string", description: "Что сказать при ответе (необязательно)" },
+          },
+          required: ["offer", "decision"],
+        },
+        audience: "all",
+        targetParam: null,
+        observationTemplate: "{name} отвечает на предложение",
+        effects: [],
+        cost: 0,
+        origin: "manual",
+        createdBy: null,
+        trainsSkill: "",
+        outcomes: [],
+        createdAt: "",
+      },
+      {
+        id: -9,
+        name: "leave_scene",
+        title: "Уйти из сцены",
+        description: "Покинуть сцену: персонаж больше не участвует в ротации ходов.",
+        parametersSchema: { type: "object", properties: {} },
+        audience: "all",
+        targetParam: null,
+        observationTemplate: "{name} уходит из сцены",
+        effects: [],
+        cost: 0,
+        origin: "manual",
+        createdBy: null,
+        trainsSkill: "",
+        outcomes: [],
+        createdAt: "",
+      },
+      {
+        id: -10,
+        name: "block_character",
+        title: "Заблокировать персонажа",
+        description:
+          "Разорвать всякий контакт с участником: он больше не сможет действовать на вас и обращаться к вам.",
+        parametersSchema: {
+          type: "object",
+          properties: { target: { type: "string", description: "Имя участника" } },
+          required: ["target"],
+        },
+        audience: "all",
+        targetParam: "target",
+        observationTemplate: "{name} блокирует {target}",
+        effects: [],
+        cost: 0,
+        origin: "manual",
+        createdBy: null,
+        trainsSkill: "",
+        outcomes: [],
+        createdAt: "",
+      }
+    );
+  }
+
+  // Общение — только тулами: свободный текст модели это мысли, их слышит только Архитектор.
+  if ((data?.participants.length ?? 0) > 1) {
+    virtualPseudoTools.push(
+      {
+        id: -11,
+        name: "say",
+        title: "Сказать вслух",
+        description:
+          "Сказать фразу вслух — услышат все в сцене (или один, если указать «кому»). " +
+          "Обычный текст без тула — внутренние мысли, его никто не слышит.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            phrase: { type: "string", description: "Что сказать (коротко, по-человечески)" },
+            to: { type: "string", description: "Кому сказать (необязательно: пусто = всем вслух)" },
+          },
+          required: ["phrase"],
+        },
+        audience: "all",
+        targetParam: "to",
+        observationTemplate: "{name} говорит: «…»",
+        effects: [],
+        cost: 0,
+        origin: "manual",
+        createdBy: null,
+        trainsSkill: "",
+        outcomes: [],
+        createdAt: "",
+      },
+      {
+        id: -12,
+        name: "text_message",
+        title: "Написать в переписку",
+        description:
+          "Сообщение в переписке (телефон/мессенджер) — увидит только получатель. " +
+          "Для общения на расстоянии: сайт знакомств, переписка между встречами.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            text: { type: "string", description: "Текст сообщения (коротко)" },
+            to: { type: "string", description: "Имя получателя" },
+          },
+          required: ["text", "to"],
+        },
+        audience: "target",
+        targetParam: "to",
+        observationTemplate: "{name} пишет {to}: «…»",
+        effects: [],
+        cost: 0,
+        origin: "manual",
+        createdBy: null,
+        trainsSkill: "",
+        outcomes: [],
+        createdAt: "",
+      }
+    );
+  }
+
+  // Гардероб: виртуальные тулы личного шкафа (как у агентов — при непустом реестре одежды).
+  if (hasClothing) {
+    virtualPseudoTools.push(
+      {
+        id: -13,
+        name: "wardrobe_browse",
+        title: "Посмотреть свой гардероб",
+        description:
+          "Что надето, что лежит в шкафу и как одежда влияет на самочувствие. Только тебе.",
+        parametersSchema: { type: "object", properties: {} },
+        audience: "self",
+        targetParam: null,
+        observationTemplate: "{name} смотрит в гардероб",
+        effects: [],
+        cost: 0,
+        origin: "manual",
+        createdBy: null,
+        trainsSkill: "",
+        outcomes: [],
+        createdAt: "",
+      },
+      {
+        id: -14,
+        name: "wear_garment",
+        title: "Надеть предмет из шкафа",
+        description:
+          "Надеть предмет из своего гардероба (обмен с тем, что надето). " +
+          "Переодевание меняет самочувствие.",
+        parametersSchema: {
+          type: "object",
+          properties: {
+            garment: { type: "string", description: "Название предмета из твоего гардероба" },
+          },
+          required: ["garment"],
+        },
+        audience: "all",
+        targetParam: null,
+        observationTemplate: "{name} переодевается",
+        effects: [],
+        cost: 0,
+        origin: "manual",
+        createdBy: null,
+        trainsSkill: "",
+        outcomes: [],
+        createdAt: "",
+      }
+    );
+  }
+
   const modeTools = modeChar
     ? [
         ...tools.filter((t) => modeChar.toolIds.includes(t.id)),
@@ -604,6 +840,8 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
         }
       }
     }
+    // respond_to_offer: решение по умолчанию — принять (легко переключить на отказ)
+    if (tool?.name === "respond_to_offer" && !preset.decision) preset.decision = "accept";
     setActionValues(preset);
     setActionError("");
   };  const runAction = async () => {
@@ -683,7 +921,9 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
           maxApiCallsPerScene: settingsForm.maxApiCallsPerScene,
           maxTokensPerScene: settingsForm.maxTokensPerScene,
           allowToolRequests: settingsForm.allowToolRequests,
+          allowAgentStops: settingsForm.allowAgentStops,
           place: settingsForm.place,
+          finish: finishOn ? { conditions: finishConditions, delayTurns: finishDelay } : null,
         },
         goals: goalDrafts,
       });
@@ -730,6 +970,17 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
 
   const { scene, participants, runtime } = data;
   const nextChar = runtime.nextCharacterId != null ? charById.get(runtime.nextCharacterId) : null;
+
+  /** Лента: «Архитектор (всё)» — без фильтра (включая audience:"none" и личные мысли),
+   *  иначе — глазами выбранного персонажа (клиентский фильтр видимости). */
+  const feedViewOptions = [
+    { value: "architect", label: "👁 Архитектор (всё)" },
+    ...participants.map((p) => ({ value: String(p.id), label: `${p.emoji} ${p.name}` })),
+  ];
+  const shownEvents =
+    feedView === "architect"
+      ? events
+      : events.filter((ev) => visibleForCharacter(ev, Number(feedView)));
 
   const curDelay = scene.config.turnDelayMs ?? 5000;
   const delayOptions = [
@@ -864,26 +1115,21 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                 onChange={(e) => setSettingsForm({ ...settingsForm, setting: e.target.value })}
               />
             </Field>
-            <Field label="Место действия (окружение: влияет на границы и одежду)">
-              <div className="flex gap-2">
-                <Input
-                  value={settingsForm.place}
-                  onChange={(e) => setSettingsForm({ ...settingsForm, place: e.target.value })}
-                  placeholder="дом, улица, кафе…"
-                />
-                <div className="w-36 shrink-0">
-                  <Dropdown
-                    value={
-                      placeOptions.some((o) => o.value === settingsForm.place)
-                        ? settingsForm.place
-                        : ""
-                    }
-                    options={placeOptions}
-                    onChange={(v) => setSettingsForm({ ...settingsForm, place: v })}
-                    title="Места из реестра (раздел «Характеристики»)"
-                  />
-                </div>
-              </div>
+            <Field
+              label="Место действия"
+              hint={
+                places.length === 0
+                  ? "Сначала создайте места в разделе „Характеристики“ → „Места“"
+                  : "окружение: влияет на границы и одежду"
+              }
+            >
+              <Dropdown
+                value={settingsForm.place}
+                options={settingsPlaceOptions}
+                onChange={(v) => setSettingsForm({ ...settingsForm, place: v })}
+                disabled={places.length === 0}
+                title="Места из реестра (раздел «Характеристики»)"
+              />
             </Field>
             <Field label="Дополнительные правила (всем персонажам)">
               <Textarea
@@ -929,6 +1175,237 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                 Разрешить агентам просить новые инструменты (request_tool)
               </span>
             </label>
+            <label className="flex cursor-pointer items-center gap-2 self-end pb-2 text-sm">
+              <input
+                type="checkbox"
+                checked={settingsForm.allowAgentStops}
+                onChange={(e) => setSettingsForm({ ...settingsForm, allowAgentStops: e.target.checked })}
+                className="h-4 w-4 accent-[var(--color-accent)]"
+              />
+              <span className="text-muted">
+                Стоп-инструменты агентов (уйти / заблокировать)
+              </span>
+            </label>
+
+            <div className="sm:col-span-2">
+              <label className="flex cursor-pointer items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={finishOn}
+                  onChange={(e) => setFinishOn(e.target.checked)}
+                  className="h-4 w-4 accent-[var(--color-accent)]"
+                />
+                <span className="text-muted">Завершать сцену по условиям</span>
+              </label>
+              {finishOn && (
+                <div className="mt-3 rounded-xl border border-line bg-black/20 p-3">
+                  <div className="mb-2 flex flex-wrap items-center gap-2">
+                    <span className="text-xs font-medium uppercase tracking-wide text-muted">
+                      Условия завершения
+                    </span>
+                    <span className="text-[11px] text-muted/70">все условия объединяются по «И»</span>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    {finishConditions.map((cond, i) => {
+                      const c = cond;
+                      const cid = c.characterId;
+                      const charOptions = [
+                        { value: "", label: "любой участник" },
+                        ...participants.map((p) => ({
+                          value: String(p.id),
+                          label: `${p.emoji} ${p.name}`,
+                        })),
+                        ...(cid != null && !participants.some((p) => p.id === cid)
+                          ? [{ value: String(cid), label: `#${cid} (не в сцене)` }]
+                          : []),
+                      ];
+                      return (
+                        <div
+                          key={i}
+                          className="flex flex-wrap items-center gap-2 rounded-lg border border-line bg-panel-2/40 p-2"
+                        >
+                          <div className="w-44 shrink-0">
+                            <Dropdown
+                              value={c.type}
+                              title="Тип условия"
+                              options={[
+                                { value: "toolCall", label: "вызов инструмента" },
+                                { value: "outcome", label: "исход инструмента" },
+                                { value: "state", label: "значение характеристики" },
+                              ]}
+                              onChange={(v) =>
+                                setFinishConditions((cs) =>
+                                  cs.map((x, j) =>
+                                    j === i ? makeCondition(v as FinishCondition["type"], cid) : x
+                                  )
+                                )
+                              }
+                            />
+                          </div>
+                          {c.type === "state" ? (
+                            <>
+                              <div className="w-56 shrink-0">
+                                <Dropdown
+                                  value={c.key}
+                                  title="Ключ состояния персонажа"
+                                  options={[
+                                    ...attrs.map((a) => ({
+                                      value: a.key,
+                                      label: `${a.emoji} ${a.label} (${a.key})`,
+                                    })),
+                                    ...(c.key && !attrs.some((a) => a.key === c.key)
+                                      ? [{ value: c.key, label: `${c.key} (нет в реестре)` }]
+                                      : []),
+                                  ]}
+                                  onChange={(v) =>
+                                    setFinishConditions((cs) =>
+                                      cs.map((x, j) => (j === i ? patchCondition(x, { key: v }) : x))
+                                    )
+                                  }
+                                />
+                              </div>
+                              <div className="w-20 shrink-0">
+                                <Dropdown
+                                  value={c.op}
+                                  title="Сравнение"
+                                  options={[
+                                    { value: ">=", label: "≥" },
+                                    { value: "<", label: "<" },
+                                    { value: "=", label: "=" },
+                                  ]}
+                                  onChange={(v) =>
+                                    setFinishConditions((cs) =>
+                                      cs.map((x, j) => (j === i ? patchCondition(x, { op: v }) : x))
+                                    )
+                                  }
+                                />
+                              </div>
+                              <Input
+                                type="number"
+                                value={String(c.value)}
+                                title="Значение"
+                                onChange={(e) =>
+                                  setFinishConditions((cs) =>
+                                    cs.map((x, j) =>
+                                      j === i ? patchCondition(x, { value: Number(e.target.value) }) : x
+                                    )
+                                  )
+                                }
+                                className="w-24"
+                              />
+                            </>
+                          ) : (
+                            <>
+                              <div className="w-60 shrink-0">
+                                <Dropdown
+                                  value={c.toolName}
+                                  title="Инструмент"
+                                  options={toolOptions}
+                                  onChange={(v) =>
+                                    setFinishConditions((cs) =>
+                                      cs.map((x, j) =>
+                                        j === i
+                                          ? patchCondition(
+                                              x,
+                                              c.type === "outcome"
+                                                ? { toolName: v, outcomeId: "" }
+                                                : { toolName: v }
+                                            )
+                                          : x
+                                      )
+                                    )
+                                  }
+                                />
+                              </div>
+                              {c.type === "outcome" &&
+                                (() => {
+                                  const outs =
+                                    tools.find((t) => t.name === c.toolName)?.outcomes ?? [];
+                                  return outs.length === 0 ? (
+                                    <span className="text-[11px] text-muted">
+                                      у инструмента нет исходов
+                                    </span>
+                                  ) : (
+                                    <div className="w-56 shrink-0">
+                                      <Dropdown
+                                        value={c.outcomeId}
+                                        title="Исход инструмента"
+                                        options={outs.map((o) => ({
+                                          value: o.id,
+                                          label: o.title || o.id,
+                                        }))}
+                                        onChange={(v) =>
+                                          setFinishConditions((cs) =>
+                                            cs.map((x, j) =>
+                                              j === i ? patchCondition(x, { outcomeId: v }) : x
+                                            )
+                                          )
+                                        }
+                                      />
+                                    </div>
+                                  );
+                                })()}
+                            </>
+                          )}
+                          <div className="w-44 shrink-0">
+                            <Dropdown
+                              value={cid != null ? String(cid) : ""}
+                              title="Кто выполняет: любой участник или конкретный"
+                              options={charOptions}
+                              onChange={(v) =>
+                                setFinishConditions((cs) =>
+                                  cs.map((x, j) =>
+                                    j === i
+                                      ? patchCondition(x, {
+                                          characterId: v === "" ? undefined : Number(v),
+                                        })
+                                      : x
+                                  )
+                                )
+                              }
+                            />
+                          </div>
+                          <button
+                            type="button"
+                            className="ml-auto px-1 text-muted transition-colors hover:text-err"
+                            title="Убрать условие"
+                            onClick={() => setFinishConditions((cs) => cs.filter((_, j) => j !== i))}
+                          >
+                            <X className="h-3.5 w-3.5" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                  {finishConditions.length === 0 && (
+                    <p className="mt-2 text-xs text-muted">Условий нет — добавьте хотя бы одно.</p>
+                  )}
+                  <div className="mt-3 flex flex-wrap items-end gap-3">
+                    <Btn
+                      variant="outline"
+                      onClick={() =>
+                        setFinishConditions((cs) => [...cs, { type: "toolCall", toolName: "" }])
+                      }
+                    >
+                      + условие
+                    </Btn>
+                    <Field
+                      label="Доиграть ходов после выполнения"
+                      hint="Условия выполнились → сцена доигрывает ещё N ходов и завершается (системное событие в ленте)"
+                      className="min-w-64"
+                    >
+                      <Input
+                        type="number"
+                        min={0}
+                        max={1000}
+                        value={finishDelay}
+                        onChange={(e) => setFinishDelay(Number(e.target.value))}
+                      />
+                    </Field>
+                  </div>
+                </div>
+              )}
+            </div>
 
             <div className="sm:col-span-2">
               <div className="mb-1.5 text-xs font-medium uppercase tracking-wide text-muted">
@@ -988,6 +1465,22 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
       <div className="flex min-h-0 flex-1">
         {/* Транскрипт */}
         <div className="relative flex min-w-0 flex-1 flex-col">
+          {/* Лента: чьими глазами смотрим + легенда модели общения */}
+          <div className="flex flex-wrap items-center gap-3 border-b border-line bg-panel/40 px-6 py-2">
+            <div className="w-56 shrink-0">
+              <Dropdown
+                size="md"
+                value={feedView}
+                onChange={setFeedView}
+                title="Чьими глазами видеть ленту: Архитектор видит всё, персонаж — только свою видимость"
+                options={feedViewOptions}
+              />
+            </div>
+            <span className="text-[11px] leading-relaxed text-muted">
+              💭 — мысли персонажей, их видите только вы (Архитектор); персонажи обмениваются
+              тулами say/text_message и действиями
+            </span>
+          </div>
           <div ref={scrollRef} onScroll={onScroll} className="flex-1 overflow-y-auto px-6 py-5">
             <div className="mx-auto flex max-w-3xl flex-col gap-3">
               {scene.setting && (
@@ -1004,7 +1497,7 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                   Событий ещё нет. Нажмите «Старт» — персонажи начнут действовать по очереди.
                 </p>
               )}
-              {events.map((ev) => (
+              {shownEvents.map((ev) => (
                 <EventRow
                   key={ev.id}
                   ev={ev}
@@ -1077,7 +1570,7 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
         </aside>
       </div>
 
-      {/* Ввод: режиссёр или персонаж */}
+      {/* Ввод: Архитектор или персонаж */}
       <footer className="border-t border-line bg-panel/60 px-6 py-3">
         <div className="mx-auto max-w-3xl">
           {/* Тоггл «кто говорит» */}
@@ -1094,7 +1587,7 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                   : "border-line bg-panel-2/50 text-muted hover:text-fg"
               }`}
             >
-              <Megaphone className="h-3 w-3" /> Режиссёр
+              <Megaphone className="h-3 w-3" /> Архитектор
             </button>
             {participants.map((p) => (
               <button
@@ -1133,7 +1626,7 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
               onKeyDown={(e) => e.key === "Enter" && send()}
               placeholder={
                 mode === "director"
-                  ? "Указание от режиссёра: событие или подтекст для персонажей…"
+                  ? "Архитектор → сцена: событие мира или мысль персонажу…"
                   : `Реплика от лица ${modeChar?.name ?? "персонажа"}…`
               }
               className="flex-1"
@@ -1142,12 +1635,12 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
               <Dropdown
                 value={directorTarget}
                 onChange={setDirectorTarget}
-                title="Кому адресовано указание режиссёра"
+                title="Кому адресовано событие от Архитектора"
                 options={[
-                  { value: "all", label: "всем" },
+                  { value: "all", label: "всем (событие мира)" },
                   ...participants.map((p) => ({
                     value: String(p.id),
-                    label: `лично ${p.name}`,
+                    label: `одному: ${p.name} (мысль в голову)`,
                   })),
                 ]}
               />
@@ -1167,6 +1660,11 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
               Отправить
             </Btn>
           </div>
+          {mode === "director" && directorTarget !== "all" && (
+            <p className="mt-1.5 text-[11px] leading-relaxed text-muted/70">
+              Личное событие приходит персонажу как собственная мысль, без фигуры наблюдателя.
+            </p>
+          )}
         </div>
       </footer>
 
@@ -1317,6 +1815,32 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                                   { value: "false", label: "нет" },
                                 ]}
                               />
+                            ) : selectedTool.name === "respond_to_offer" && key === "offer" ? (
+                              <Input
+                                value={curVal}
+                                onChange={(e) =>
+                                  setActionValues((v) => ({ ...v, [key]: e.target.value }))
+                                }
+                                placeholder="id предложения, напр. 3"
+                              />
+                            ) : selectedTool.name === "respond_to_offer" && key === "decision" ? (
+                              <Dropdown
+                                direction="down"
+                                value={actionValues[key] ?? "accept"}
+                                onChange={(v) => setActionValues((s) => ({ ...s, [key]: v }))}
+                                options={[
+                                  { value: "accept", label: "принять (accept)" },
+                                  { value: "decline", label: "отклонить (decline)" },
+                                ]}
+                              />
+                            ) : selectedTool.name === "respond_to_offer" && key === "words" ? (
+                              <Input
+                                value={curVal}
+                                onChange={(e) =>
+                                  setActionValues((v) => ({ ...v, [key]: e.target.value }))
+                                }
+                                placeholder="необязательно"
+                              />
                             ) : isPlaceParam ? (
                               <div className="flex flex-wrap gap-1.5">
                                 {places.map((pl) => (
@@ -1338,46 +1862,36 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                                 ))}
                               </div>
                             ) : isCharParam ? (
-                              <div className="flex flex-col gap-2">
-                                <div className="flex flex-wrap gap-1.5">
-                                  {!required && (
-                                    <button
-                                      type="button"
-                                      onClick={() => setActionValues((v) => ({ ...v, [key]: "" }))}
-                                      className={`rounded-full border px-3 py-1 text-xs transition-colors ${
-                                        curVal === ""
-                                          ? "border-accent/60 bg-accent/20 text-fg"
-                                          : "border-line bg-panel-2/50 text-muted hover:text-fg"
-                                      }`}
-                                    >
-                                      всем / не указывать
-                                    </button>
-                                  )}
-                                  {participants.map((pt) => (
-                                    <button
-                                      type="button"
-                                      key={pt.id}
-                                      onClick={() =>
-                                        setActionValues((v) => ({ ...v, [key]: pt.name }))
-                                      }
-                                      className={`rounded-full border px-3 py-1 text-xs transition-colors ${
-                                        curVal === pt.name
-                                          ? "border-accent/60 bg-accent/20 text-fg"
-                                          : "border-line bg-panel-2/50 text-muted hover:text-fg"
-                                      }`}
-                                    >
-                                      {pt.emoji} {pt.name}
-                                    </button>
-                                  ))}
-                                </div>
-                                <Input
-                                  value={curVal}
-                                  onChange={(e) =>
-                                    setActionValues((v) => ({ ...v, [key]: e.target.value }))
-                                  }
-                                  placeholder="…или введите имя вручную"
-                                  className="text-xs"
-                                />
+                              <div className="flex flex-wrap gap-1.5">
+                                {!required && (
+                                  <button
+                                    type="button"
+                                    onClick={() => setActionValues((v) => ({ ...v, [key]: "" }))}
+                                    className={`rounded-full border px-3 py-1 text-xs transition-colors ${
+                                      curVal === ""
+                                        ? "border-accent/60 bg-accent/20 text-fg"
+                                        : "border-line bg-panel-2/50 text-muted hover:text-fg"
+                                    }`}
+                                  >
+                                    всем / не указывать
+                                  </button>
+                                )}
+                                {participants.map((pt) => (
+                                  <button
+                                    type="button"
+                                    key={pt.id}
+                                    onClick={() =>
+                                      setActionValues((v) => ({ ...v, [key]: pt.name }))
+                                    }
+                                    className={`rounded-full border px-3 py-1 text-xs transition-colors ${
+                                      curVal === pt.name
+                                        ? "border-accent/60 bg-accent/20 text-fg"
+                                        : "border-line bg-panel-2/50 text-muted hover:text-fg"
+                                    }`}
+                                  >
+                                    {pt.emoji} {pt.name}
+                                  </button>
+                                ))}
                               </div>
                             ) : isStr ? (
                               <Textarea
@@ -1744,16 +2258,22 @@ function EventRow({
   }
 
   if (ev.type === "director") {
-    const label =
-      ev.audience === "all"
-        ? "всем"
-        : Array.isArray(ev.audience)
-          ? `лично: ${ev.audience.map((x) => charById.get(x)?.name ?? "?").join(", ")}`
-          : "";
+    // События Архитектора: всем — «событие мира», лично — «мысль в голову» (без фигуры наблюдателя).
+    const personal = Array.isArray(ev.audience);
+    const label = Array.isArray(ev.audience)
+      ? `🔒 Мысль в голову: ${ev.audience.map((x) => charById.get(x)?.name ?? "?").join(", ")}`
+      : "Событие мира";
     return (
-      <div className="anim-in rounded-xl border border-warn/30 bg-warn/5 px-4 py-2.5 text-sm">
+      <div
+        className="anim-in rounded-xl border border-warn/30 bg-warn/5 px-4 py-2.5 text-sm"
+        title={
+          personal
+            ? "Личное событие от Архитектора: персонаж воспринимает его как собственную мысль"
+            : "Событие мира от Архитектора: знают все участники"
+        }
+      >
         <span className="mr-2 text-xs font-medium uppercase tracking-wide text-warn">
-          Режиссёр → {label}
+          {label}
         </span>
         <span className="text-fg/90">{ev.payload.text}</span>
       </div>
@@ -1761,14 +2281,24 @@ function EventRow({
   }
 
   if (ev.type === "speech") {
+    // Свободный текст модели — внутренние мысли: слышит только Архитектор,
+    // персонажи общаются тулами say/text_message (их наблюдения — в action-событиях).
     return (
-      <div className="anim-in group flex gap-3">
-        <span className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-line bg-panel-2 text-lg ${color}`}>
+      <div className="anim-in group flex gap-3 opacity-80">
+        <span
+          className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-dashed border-line bg-panel-2/40 text-lg ${color}`}
+        >
           {actor?.emoji ?? "❓"}
         </span>
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2">
             <span className={`text-xs font-semibold ${color}`}>{actor?.name ?? "Неизвестный"}</span>
+            <span
+              className="text-[10px] text-muted/70"
+              title="Внутренняя мысль — её видите только вы (Архитектор); персонажи её не слышат"
+            >
+              💭 (мысль)
+            </span>
             <span className="text-[10px] text-muted/50">
               T{ev.turn} · {fmtTime(ev.createdAt)}
             </span>
@@ -1780,7 +2310,7 @@ function EventRow({
               <Braces className="h-3.5 w-3.5" />
             </button>
           </div>
-          <div className="mt-1 whitespace-pre-wrap rounded-xl rounded-tl-sm border border-line bg-panel px-4 py-2.5 text-sm leading-relaxed">
+          <div className="mt-1 whitespace-pre-wrap rounded-xl rounded-tl-sm border border-dashed border-line/70 px-4 py-2 text-sm italic leading-relaxed text-muted">
             {ev.payload.text}
           </div>
         </div>

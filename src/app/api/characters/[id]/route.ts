@@ -4,6 +4,7 @@ import {
   deleteCharacter,
   getCharacter,
   getProvider,
+  mirrorStateKeysToSceneSnapshots,
   updateCharacter,
 } from "@/db/queries";
 import { ApiError, characterSchema, jsonError, parseBody, parseId } from "@/lib/api";
@@ -24,10 +25,40 @@ export async function GET(_req: Request, { params }: Ctx) {
 export async function PATCH(req: Request, { params }: Ctx) {
   try {
     const { id } = await params;
+    const cid = parseId(id);
     const data = await parseBody(req, characterSchema.partial());
     if (data.providerId != null && !getProvider(data.providerId))
       throw new ApiError(400, "Провайдер не найден");
-    const c = updateCharacter(parseId(id), data);
+    if (data.fallbackProviderId != null && !getProvider(data.fallbackProviderId))
+      throw new ApiError(400, "Страховочный провайдер не найден");
+    if (data.isHuman === true) {
+      // Человеку страховка не нужна: движок за него не вызывает модели.
+      data.fallbackProviderId = null;
+      data.fallbackModel = "";
+    }
+    // state мёржится по ключам, а не заменяется целиком: редактор мог быть
+    // открыт до хода движка, и полная замена стирала бы свежие изменения
+    // (деньги, одежда, эффекты). null в значении = удалить ключ.
+    if (data.state) {
+      const cur = getCharacter(cid);
+      if (!cur) throw new ApiError(404, "Персонаж не найден");
+      const merged: Record<string, unknown> = { ...cur.state };
+      const edited = new Map<string, unknown | null>();
+      for (const [k, v] of Object.entries(data.state)) {
+        if (v === null) {
+          delete merged[k];
+          edited.set(k, null);
+        } else {
+          merged[k] = v;
+          edited.set(k, v);
+        }
+      }
+      data.state = merged;
+      // Правки из редактора переживают «Заново» сцен: новые ключи попадают
+      // и в снимки участий (existing значения не трогаем — это прогресс сцен).
+      mirrorStateKeysToSceneSnapshots(cid, edited);
+    }
+    const c = updateCharacter(cid, data);
     if (!c) throw new ApiError(404, "Персонаж не найден");
     return NextResponse.json(c);
   } catch (e) {

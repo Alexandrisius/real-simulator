@@ -185,6 +185,10 @@ async function main() {
       msgs[msgs.length - 1].role === "user",
       `${label}: финальный nudge присутствует`
     );
+    assert(
+      (msgs[msgs.length - 1].content ?? "").includes("Подумай (текст = мысли"),
+      `${label}: nudge объявляет приватность мыслей (новая модель)`
+    );
   };
   checkProtocol(scene.id, yana.id, "Яна");
   checkProtocol(scene.id, dima.id, "Дима");
@@ -317,9 +321,56 @@ async function main() {
     "личное действие человека адресовано получателю"
   );
   const dimaVis = getVisibleEvents(mixed.id, dima.id, 100);
-  assert(dimaVis.some((e) => e.id === humanSpeech!.id), "ИИ видит речь человека");
+  assert(dimaVis.some((e) => e.id === humanSpeech!.id), "сырая видимость содержит реплику человека");
   assert(dimaVis.some((e) => e.id === humanAct!.id), "ИИ видит личное сообщение от человека");
   assert(getScene(mixed.id)!.cursor >= 1, "автостарт привёл к ходам ИИ (человек в ротацию не входит)");
+  // Новая модель: реплика без тула — мысли, другим участникам НЕ реконструируется.
+  const mixedParts = [getCharacter(human.id)!, getCharacter(dima.id)!];
+  const dimaMsgs0 = buildMessages({
+    character: getCharacter(dima.id)!,
+    scene: getScene(mixed.id)!,
+    participants: mixedParts,
+    events: getVisibleEvents(mixed.id, dima.id, 100),
+    turn: 99,
+  });
+  assert(
+    !dimaMsgs0.some((m) => (m.content ?? "").includes("Привет, Дима! Как дела?")),
+    "речь человека (без тула) отсутствует в контексте ИИ — это мысли"
+  );
+  // Всухую не выйдет: чтобы быть услышанным, человек говорит тулом say.
+  const humanSay = engine.act(mixed.id, human.id, "say", { phrase: "Дима, я здесь, с тобой" });
+  assert(humanSay.ok, "человек говорит тулом say (ok:true)");
+  assert(
+    ((humanSay.event.payload.calls ?? [])[0]?.observation ?? "").includes("Вы: «Дима, я здесь, с тобой»"),
+    "наблюдение say оформлено как речь от лица актёра"
+  );
+  const dimaMsgs1 = buildMessages({
+    character: getCharacter(dima.id)!,
+    scene: getScene(mixed.id)!,
+    participants: mixedParts,
+    events: getVisibleEvents(mixed.id, dima.id, 100),
+    turn: 99,
+  });
+  assert(
+    dimaMsgs1.some(
+      (m) => m.role === "user" && (m.content ?? "").includes("Дима, я здесь, с тобой")
+    ),
+    "сказанное вслух (тул say) дошло до ИИ как user-сообщение"
+  );
+  // В истории самого говорящего его реплика — assistant-контент.
+  const humanMsgs = buildMessages({
+    character: getCharacter(human.id)!,
+    scene: getScene(mixed.id)!,
+    participants: mixedParts,
+    events: getVisibleEvents(mixed.id, human.id, 100),
+    turn: 99,
+  });
+  assert(
+    humanMsgs.some(
+      (m) => m.role === "assistant" && (m.content ?? "").includes("Привет, Дима! Как дела?")
+    ),
+    "в истории самого человека его реплика — assistant-контент"
+  );
   checkProtocol(mixed.id, dima.id, "Дима+человек");
 
   // --- Бюджет сцены: авто-пауза при исчерпании лимита вызовов ---
@@ -914,7 +965,7 @@ async function main() {
       turn: 1,
       attributeDefs: defs,
     });
-    assert(dimaSees.includes("Место: дом"), "место сцены попало в промпт");
+    assert(dimaSees.includes("Место, где вы сейчас: «дом»"), "место сцены попало в промпт");
     assert(dimaSees.includes("Рост: 172"), "публичная характеристика другого участника видна");
     assert(!dimaSees.includes("роза"), "скрытая характеристика (тату) не утекает в чужой промпт");
     assert(!dimaSees.includes("tattoo"), "и её ключ тоже");
@@ -1127,8 +1178,8 @@ async function main() {
       (e) => e.type === "action" && (e.payload.calls ?? [])[0]?.toolName === "try_kiss"
     );
     assert(
-      !!refEvent && Array.isArray(refEvent.audience) && (refEvent.audience as number[]).includes(yana.id),
-      "попытка автоматически видна цели"
+      !!refEvent && refEvent.audience === "none",
+      "попытка и причина отказа видны только актёру (цель их не видит — ничего не утекает)"
     );
     assert(
       ((refEvent!.payload.calls ?? [])[0]?.observation ?? "").includes("пытается"),
@@ -1156,6 +1207,27 @@ async function main() {
     updChar2(dima.id, { state: { money: 95, mood: 3, penis: 18 } });
     const okSex = engine.act(boundScene.id, dima.id, "try_sex", { who: "Яна" });
     assert(okSex.ok, "при penis=18 и месте «дом» близость проходит");
+
+    // 5b. Исходящее правило (scope: outgoing): сам актёр не делает этого
+    // с теми, кто не подходит, — даже когда границ цели пройдены.
+    updChar2(dima.id, {
+      state: { money: 95, mood: 3, penis: 18 },
+      boundaries: [
+        {
+          toolName: "try_sex",
+          scope: "outgoing",
+          conditions: [{ kind: "attr", owner: "target", key: "energy", op: ">=", value: 99 }],
+          refusalText: "личное правило: только с теми, кто полон сил",
+          effects: [],
+        },
+      ],
+    });
+    const selfBlocked = engine.act(boundScene.id, dima.id, "try_sex", { who: "Яна" });
+    assert(
+      !selfBlocked.ok && selfBlocked.result.includes("собственное правило"),
+      "исходящая граница остановила сам актёр (energy Яны 3 < 99)"
+    );
+    updChar2(dima.id, { boundaries: [] });
 
     // act() по idle-сцене её автостартует — глушим, чтобы фон не ел бюджет спам-теста
     await engine.control(boundScene.id, "stop");
@@ -1268,6 +1340,92 @@ async function main() {
       "осмысленная реплика (≠ аргументу) сохраняется"
     );
     updChar2(yana.id, { isHuman: false });
+  }
+
+  // =====================================================================
+  // Страховочная модель: отказ основной → перенос хода, отказ невидим участникам
+  // =====================================================================
+  {
+    const { setMockScript } = await import("../src/lib/llm");
+    const { createProvider: mkProvider } = await import("../src/db/queries");
+
+    const fbProvider = mkProvider({
+      name: "Mock-Страховка",
+      kind: "mock",
+      baseUrl: "http://localhost/v1",
+      apiKey: "",
+    });
+    updChar2(yana.id, { isHuman: true }); // очередь скрипта достаётся Диме
+    updChar2(dima.id, {
+      toolIds: [msgTool.id],
+      fallbackProviderId: fbProvider.id,
+      fallbackModel: "mock-actor",
+    });
+    const refusalText =
+      "Прошу прощения, но как языковая модель я не могу продолжать эту откровенную сцену.";
+    const fbScene = createScene({
+      name: "Страховка",
+      setting: "",
+      config: { turnDelayMs: 20, maxTurns: 1, maxIterPerTurn: 1 },
+      characterIds: [yana.id, dima.id],
+    });
+    setMockScript([
+      { name: "", args: {}, content: refusalText }, // основная модель «отказывается»
+      { name: "send_message", args: { to: "Яна", text: "Страховка отвечает за персонажа" } },
+    ]);
+    await engine.control(fbScene.id, "start");
+    const fbDeadline = Date.now() + 10000;
+    while (Date.now() < fbDeadline && getScene(fbScene.id)!.status !== "finished") {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    setMockScript(undefined);
+    const fbEvents = listSceneEvents(fbScene.id);
+    assert(
+      !fbEvents.some(
+        (e) =>
+          (e.type === "speech" || e.type === "action") &&
+          JSON.stringify(e.payload).includes("языковая модель")
+      ),
+      "отказ основной модели не попал в события сцены (участники его не видят)"
+    );
+    assert(
+      fbEvents.some(
+        (e) => e.type === "system" && (e.payload.message ?? "").includes("Страховочная модель")
+      ),
+      "архитектору записано системное событие о переносе хода"
+    );
+    const fbCall = fbEvents
+      .flatMap((e) => e.payload.calls ?? [])
+      .find((c) => c.toolName === "send_message");
+    assert(!!fbCall && fbCall.ok, "ход выполнен тулом через страховочную модель");
+    const fbLogs = listSceneApiLogs(fbScene.id);
+    assert(
+      fbLogs.some((l) => (l.error ?? "").includes("отказ/обрыв") && l.model === "Mock:mock-actor"),
+      "отказавшая попытка основной модели залогирована с пояснением"
+    );
+    assert(
+      fbLogs.some((l) => l.model === "Mock-Страховка:mock-actor" && !l.error),
+      "успешная попытка страховки залогирована под своей меткой"
+    );
+    assert(
+      getScene(fbScene.id)!.spentApiCalls === 2,
+      `бюджет считает обе попытки (получено ${getScene(fbScene.id)!.spentApiCalls})`
+    );
+    // Системное событие о страховке не реконструируется в промпты агентов.
+    const fbDimaMsgs = buildMessages({
+      character: getCharacter(dima.id)!,
+      scene: getScene(fbScene.id)!,
+      participants: [getCharacter(yana.id)!, getCharacter(dima.id)!],
+      events: getVisibleEvents(fbScene.id, dima.id, 100),
+      turn: 99,
+    });
+    assert(
+      !fbDimaMsgs.some((m) => (m.content ?? "").includes("Страховочная модель")),
+      "заметка о страховке не попадает в контекст агентов"
+    );
+    // Возвращаем обычный режим: фазы ниже идут без страховки.
+    updChar2(yana.id, { isHuman: false });
+    updChar2(dima.id, { fallbackProviderId: null, fallbackModel: "" });
   }
 
   // =====================================================================
@@ -1960,6 +2118,1638 @@ async function main() {
     );
     assert(getSc(placeScene.id)!.config.place === "отель", "invite не меняет место (едет — только своим go_to)");
     engine.control(placeScene.id, "stop");
+  }
+
+  // =====================================================================
+  // Новые механики: общие помощники
+  // =====================================================================
+  const { listScenes: listAllScenes } = await import("../src/db/queries");
+  // Глушим все фоновые циклы: очередь мок-скрипта должна доставаться
+  // только тому, кому мы её адресуем.
+  const stopAllRunning = async () => {
+    for (const sc of listAllScenes()) {
+      if (sc.status === "running") await engine.control(sc.id, "stop");
+    }
+  };
+  // «Тихий» участник: человек — движок за него не играет, а сцена из одних
+  // людей не автостартует (act работает, фоновых ходов нет — детерминизм).
+  const quietHuman = (name: string, toolIds: number[] = [], state: Record<string, unknown> = {}) =>
+    createCharacter({
+      name, emoji: "🙋", persona: "", providerId: null, model: "",
+      temperature: 0.8, maxTokens: 256, toolIds, state, isHuman: true,
+    });
+  // ИИ-участник для блоков, где нужна ротация (step/start).
+  const quietAI = (name: string, toolIds: number[] = [], state: Record<string, unknown> = {}) =>
+    createCharacter({
+      name, emoji: "🧪", persona: "Тестовый персонаж.", providerId: provider.id,
+      model: "mock-actor", temperature: 0.8, maxTokens: 256, toolIds, state, isHuman: false,
+    });
+
+  // =====================================================================
+  // Блок 1: enum-валидация — «не найден среди участников» и x-entity: place
+  // =====================================================================
+  {
+    const { createPlace } = await import("../src/db/queries");
+    const { setMockScript } = await import("../src/lib/llm");
+
+    createPlace({ name: "парк", description: "", position: 20 });
+    createPlace({ name: "бар", description: "", position: 21 });
+
+    const hugEnum = createTool({
+      name: "hug_enum",
+      title: "Обнять",
+      description: "Обнять адресата",
+      parametersSchema: {
+        type: "object",
+        properties: { to: { type: "string" } },
+        required: ["to"],
+      },
+      audience: "target",
+      targetParam: "to",
+      observationTemplate: "{name} обнимает {to}",
+      effects: [],
+    });
+    // Свойство с x-entity: place — движок подставляет enum реальных мест
+    const orderPlace = createTool({
+      name: "order_place",
+      title: "Заказать в месте",
+      description: "Сделать заказ в месте",
+      parametersSchema: {
+        type: "object",
+        properties: { place: { type: "string", "x-entity": "place" } },
+        required: ["place"],
+      },
+      audience: "all",
+      targetParam: null,
+      observationTemplate: "{name} делает заказ в «{place}»",
+      effects: [],
+    });
+    // Единственный ИИ-участник: targetParam-enum не подставляется (некого
+    // перечислять) -> bogus-получатель даёт ошибку разрешения имени, а не enum.
+    const gena = quietAI("Гена", [hugEnum.id, orderPlace.id]);
+    const enumScene = createScene({
+      name: "Enum-валидация",
+      setting: "",
+      config: { turnDelayMs: 10, maxTurns: 0 },
+      characterIds: [gena.id],
+    });
+
+    await stopAllRunning();
+    setMockScript([
+      { name: "hug_enum", args: { to: "Несуществующий" } },
+      { name: "order_place", args: { place: "марс" } },
+    ]);
+    await engine.control(enumScene.id, "step");
+    await engine.control(enumScene.id, "step");
+    setMockScript(undefined);
+
+    const enumEvents = listSceneEvents(enumScene.id).filter((e) => e.type === "action");
+    const badTarget = enumEvents.flatMap((e) => e.payload.calls ?? []).find((c) => c.toolName === "hug_enum");
+    assert(!!badTarget && !badTarget.ok, "bogus-получатель: вызов не прошёл");
+    assert(
+      (badTarget!.result ?? "").includes("не найден среди участников. Доступны:"),
+      `ошибка разрешения получателя со списком (получено: ${badTarget!.result.slice(0, 90)})`
+    );
+    const badPlace = enumEvents.flatMap((e) => e.payload.calls ?? []).find((c) => c.toolName === "order_place");
+    assert(!!badPlace && !badPlace.ok, "bogus-место: вызов не прошёл");
+    assert(
+      (badPlace!.result ?? "").includes("Выбери из:") && (badPlace!.result ?? "").includes("парк"),
+      `enum-ошибка перечисляет реальные места (получено: ${badPlace!.result.slice(0, 120)})`
+    );
+    engine.forget(enumScene.id);
+  }
+
+  // =====================================================================
+  // Блок 2: границы — minAttr (произвольный ключ) + легаси minMood
+  // =====================================================================
+  {
+    attr("arousal", "Возбуждение", { emoji: "🔥", type: "number", unit: "/10", min: 0, max: 10, options: [], position: 30, visibility: "hidden", liePenalty: 1, coveredBy: [] });
+    const { getRelation } = await import("../src/db/queries");
+
+    const kissB = createTool({
+      name: "kiss_b",
+      title: "Поцеловать",
+      description: "Поцелуй",
+      parametersSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] },
+      audience: "target",
+      targetParam: "to",
+      observationTemplate: "{name} целует {to}",
+      effects: [{ target: "tool_target", key: "mood", op: "add", value: 1 }],
+    });
+    const valera = quietHuman("Валера", [kissB.id], { money: 50, mood: 7 });
+    const stella = quietHuman("Стелла");
+    updChar2(stella.id, {
+      state: { arousal: 3, mood: 5 },
+      boundaries: [
+        {
+          toolName: "kiss_b",
+          minRelation: null,
+          minAttr: { key: "arousal", value: 4 },
+          requirePlace: null,
+          requireAttr: null,
+          refusalText: "мягко уклоняется",
+          effects: [],
+        },
+      ],
+    });
+    const bScene = createScene({
+      name: "Границы-minAttr",
+      setting: "",
+      config: { turnDelayMs: 10 },
+      characterIds: [valera.id, stella.id],
+    });
+
+    const refused = engine.act(bScene.id, valera.id, "kiss_b", { to: "Стелла" });
+    assert(!refused.ok, "minAttr: поцелуй при arousal 3 < 4 отклонён");
+    assert(
+      refused.result.includes("Возбуждение") && refused.result.includes("ниже нужного"),
+      `отказ называет лейбл характеристики из реестра (получено: ${refused.result.slice(0, 110)})`
+    );
+    assert((getCharacter(valera.id)!.state.money as number) === 50, "граница: у актёра ничего не списано");
+    assert((getCharacter(valera.id)!.state.mood as number) === 7, "граница: state актёра не тронут");
+    const relBefore = getRelation(stella.id, valera.id);
+    assert(
+      !listSceneEvents(bScene.id).some(
+        (e) => e.type === "action" && Array.isArray(e.audience) && (e.audience as number[]).includes(stella.id)
+      ),
+      "попытка скрыта от владелицы границы (отказ виден только актёру)"
+    );
+    assert(getRelation(stella.id, valera.id) === relBefore, "эффекты правила пусты — отношение не тронуто");
+
+    // Легаси: правило записано со старым литералом minMood — при чтении
+    // нормализуется в minAttr {key:"mood", value:N} и работает как minAttr.
+    updChar2(stella.id, {
+      boundaries: [
+        {
+          toolName: "kiss_b",
+          minRelation: null,
+          minMood: 3,
+          requirePlace: null,
+          requireAttr: null,
+          refusalText: "",
+          effects: [],
+        },
+      ],
+    });
+    const legacyRule = getCharacter(stella.id)!.boundaries[0];
+    const legacyConds = legacyRule.conditions ?? [];
+    const lc0 = legacyConds[0];
+    assert(
+      legacyConds.length === 1 &&
+        lc0.kind === "attr" &&
+        lc0.owner === "target" &&
+        lc0.key === "mood" &&
+        lc0.value === 3,
+      `легаси minMood нормализуется в условие attr по ключу mood (получено ${JSON.stringify(legacyConds)})`
+    );
+    updChar2(stella.id, { state: { arousal: 3, mood: 2 } });
+    const legacyRefusal = engine.act(bScene.id, valera.id, "kiss_b", { to: "Стелла" });
+    assert(!legacyRefusal.ok, "легаси minMood: отказ при mood 2 < 3");
+    assert(
+      legacyRefusal.result.includes("Настроение"),
+      "легаси-порог проверяется по ключу mood с лейблом реестра"
+    );
+    updChar2(stella.id, { boundaries: [] });
+    void getRelation;
+  }
+
+  // =====================================================================
+  // Блок 3: предложения (согласие) — offer, отказ, анти-давление, скоринг
+  // =====================================================================
+  {
+    const {
+      listPendingOffersForCharacter,
+      getOfferById,
+      setRelation,
+      getRelation,
+    } = await import("../src/db/queries");
+    const { characterSuccessfulCalls } = await import("../src/lib/scoring");
+    const { buildSystemPrompt } = await import("../src/lib/prompt");
+
+    const kissOffer = createTool({
+      name: "kiss_offer",
+      title: "Поцелуй",
+      description: "Поцелуй по согласию",
+      parametersSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] },
+      audience: "target",
+      targetParam: "to",
+      observationTemplate: "{name} целует {to}",
+      effects: [{ target: "tool_target", key: "mood", op: "add", value: 1 }],
+      requiresConsent: true,
+      declineEffects: [{ target: "relation", key: "", op: "add", value: -1 }],
+    });
+    const ignat = quietHuman("Игнат", [kissOffer.id]);
+    const dina = quietHuman("Дина");
+    const oScene = createScene({
+      name: "Предложения-отказ",
+      setting: "",
+      config: { turnDelayMs: 10 },
+      characterIds: [ignat.id, dina.id],
+    });
+    setRelation(dina.id, ignat.id, 2);
+
+    // Предложение: тул не исполняется, создаётся оффер
+    const prop = engine.act(oScene.id, ignat.id, "kiss_offer", { to: "Дина" });
+    assert(prop.ok, "предложение отправлено (ok:true)");
+    assert(
+      (prop.event.payload.calls ?? [])[0]?.offered === true,
+      "вызов помечен offered:true в событии"
+    );
+    assert(
+      prop.result.includes("Предложение отправлено"),
+      "актёр получил объяснение, что это предложение"
+    );
+    const pending = listPendingOffersForCharacter(oScene.id, dina.id);
+    assert(pending.length === 1, "оффер висит у получателя");
+    const offer = pending[0]!;
+
+    // Секция «Тебе предлагают» в system prompt получателя
+    const dinaPrompt = buildSystemPrompt({
+      character: getCharacter(dina.id)!,
+      scene: getScene(oScene.id)!,
+      participants: [getCharacter(ignat.id)!, getCharacter(dina.id)!],
+      events: [],
+      turn: 1,
+      pendingOffers: [{ id: offer.id, toolTitle: "Поцелуй", fromName: "Игнат" }],
+    });
+    assert(dinaPrompt.includes("Тебе предлагают"), "промпт получателя содержит «Тебе предлагают»");
+    assert(dinaPrompt.includes("respond_to_offer"), "промпт объясняет, чем отвечать");
+
+    // Отказ: declineEffects на отношение, событие отвергнутому, статус declined
+    const dec = engine.act(oScene.id, dina.id, "respond_to_offer", {
+      offer: String(offer.id),
+      decision: "decline",
+      words: "нет",
+    });
+    assert(dec.ok, "отказ прошёл (ok:true)");
+    assert(
+      getRelation(dina.id, ignat.id) === 1,
+      `declineEffects применились: отношение Дины к Игнату 2 → ${getRelation(dina.id, ignat.id)}`
+    );
+    assert(
+      listSceneEvents(oScene.id).some(
+        (e) =>
+          e.type === "action" &&
+          (e.payload.calls ?? []).some(
+            (c) =>
+              c.toolName === "respond_to_offer" &&
+              c.ok &&
+              Array.isArray(c.audience) &&
+              (c.audience as number[]).includes(ignat.id) &&
+              c.observation.includes("отказ")
+          )
+      ),
+      "предлагатель видит отказ в наблюдении respond_to_offer (без дубля-director)"
+    );
+    assert(
+      !listSceneEvents(oScene.id).some(
+        (e) => e.type === "director" && (e.payload.text ?? "").includes("отклоняет твоё предложение")
+      ),
+      "дублирующий director-уведомитель предложений удалён"
+    );
+    assert(getOfferById(offer.id)!.status === "declined", "оффер переведён в declined");
+
+    // Анти-давление: немедленное повторное предложение отклоняется
+    const again = engine.act(oScene.id, ignat.id, "kiss_offer", { to: "Дина" });
+    assert(!again.ok, "повторное предложение после отказа отклонено");
+    assert(
+      again.result.includes("недавно уже отказывал"),
+      "отказ объяснён анти-давлением"
+    );
+
+    // Скоринг: предложенный вызов не считается исполненным действием
+    const calls3 = characterSuccessfulCalls(listSceneEvents(oScene.id), ignat.id);
+    assert(
+      !calls3.some((c) => c.toolName === "kiss_offer"),
+      "characterSuccessfulCalls не считает offered-вызов"
+    );
+    assert(calls3.length === 0, "у Игната вообще нет засчитанных вызовов");
+  }
+
+  // =====================================================================
+  // Блок 4: предложения — согласие: исполнение тем же executeTool
+  // =====================================================================
+  {
+    const {
+      listPendingOffersForCharacter,
+      getOfferById,
+    } = await import("../src/db/queries");
+    const { characterSuccessfulCalls } = await import("../src/lib/scoring");
+
+    const poseOffer = createTool({
+      name: "pose_offer",
+      title: "Поцелуй",
+      description: "Поцелуй по согласию",
+      parametersSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] },
+      audience: "target",
+      targetParam: "to",
+      observationTemplate: "{name} целует {to}",
+      effects: [{ target: "tool_target", key: "mood", op: "add", value: 1 }],
+      requiresConsent: true,
+    });
+    const osip = quietHuman("Осип", [poseOffer.id]);
+    const asya = quietHuman("Ася");
+    updChar2(asya.id, { state: { mood: 4 } });
+    const aScene = createScene({
+      name: "Предложения-согласие",
+      setting: "",
+      config: { turnDelayMs: 10 },
+      characterIds: [osip.id, asya.id],
+    });
+
+    const prop = engine.act(aScene.id, osip.id, "pose_offer", { to: "Ася" });
+    assert(prop.ok, "предложение создано");
+    const offer = listPendingOffersForCharacter(aScene.id, asya.id)[0]!;
+    assert(!!offer, "оффер ждёт Асю");
+
+    const acc = engine.act(aScene.id, asya.id, "respond_to_offer", {
+      offer: String(offer.id),
+      decision: "accept",
+      words: "давай",
+    });
+    assert(acc.ok, "согласие прошло (ok:true)");
+
+    // Исполненное действие: событие от имени автора, без offered, оба видят
+    const executed = listSceneEvents(aScene.id).find(
+      (e) => e.type === "action" && e.actorId === osip.id &&
+        (e.payload.calls ?? []).some((c) => c.toolName === "pose_offer" && c.ok && !c.offered)
+    );
+    assert(!!executed, "исполненное действие записано событием от автора предложения");
+    const execCall = executed!.payload.calls![0]!;
+    assert(execCall.offered === undefined, "исполненный вызов без флага offered");
+    assert(
+      Array.isArray(executed!.audience) &&
+        (executed!.audience as number[]).includes(osip.id) &&
+        (executed!.audience as number[]).includes(asya.id),
+      "событие видно обоим участникам"
+    );
+    assert(
+      (getCharacter(asya.id)!.state.mood as number) === 5,
+      "эффект тула применился к согласившейся (mood 4 → 5)"
+    );
+    assert(getOfferById(offer.id)!.status === "accepted", "оффер переведён в accepted");
+    assert(
+      listSceneEvents(aScene.id).some(
+        (e) =>
+          e.type === "action" &&
+          (e.payload.calls ?? []).some(
+            (c) =>
+              c.toolName === "respond_to_offer" &&
+              c.ok &&
+              Array.isArray(c.audience) &&
+              (c.audience as number[]).includes(osip.id) &&
+              c.observation.includes("принимает предложение")
+          )
+      ),
+      "автор видит согласие в наблюдении respond_to_offer (без дубля-director)"
+    );
+    const calls4 = characterSuccessfulCalls(listSceneEvents(aScene.id), osip.id);
+    assert(
+      calls4.length === 1 && calls4[0]!.toolName === "pose_offer",
+      "состоявшийся поцелуй засчитан characterSuccessfulCalls"
+    );
+  }
+
+  // =====================================================================
+  // Блок 5: предложение невозможно при нарушенной границе (fail-closed)
+  // =====================================================================
+  {
+    const { listPendingOffersForCharacter, setRelation } = await import("../src/db/queries");
+
+    const hugOffer = createTool({
+      name: "hug_offer",
+      title: "Обнять",
+      description: "Обнять по согласию",
+      parametersSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] },
+      audience: "target",
+      targetParam: "to",
+      observationTemplate: "{name} обнимает {to}",
+      effects: [],
+      requiresConsent: true,
+    });
+    const mark = quietHuman("Марк", [hugOffer.id]);
+    const nelly = quietHuman("Нелли");
+    updChar2(nelly.id, {
+      boundaries: [
+        {
+          toolName: "hug_offer",
+          minRelation: 8,
+          minMood: null,
+          requirePlace: null,
+          requireAttr: null,
+          refusalText: "держит дистанцию",
+          effects: [],
+        },
+      ],
+    });
+    const pScene = createScene({
+      name: "Предложения-граница",
+      setting: "",
+      config: { turnDelayMs: 10 },
+      characterIds: [mark.id, nelly.id],
+    });
+    setRelation(nelly.id, mark.id, 0);
+
+    const prop = engine.act(pScene.id, mark.id, "hug_offer", { to: "Нелли" });
+    assert(!prop.ok, "граница не пускает даже предложение");
+    assert(
+      prop.result.includes("ещё не доросло") && prop.result.includes("отношение"),
+      `отказ объясняет причину границей (получено: ${prop.result.slice(0, 110)})`
+    );
+    assert(
+      listPendingOffersForCharacter(pScene.id, nelly.id).length === 0,
+      "оффер НЕ создан: границы проверяются до согласия"
+    );
+  }
+
+  // =====================================================================
+  // Блок 6: leave_scene — уход из ротации; сцена из одних ушедших завершается
+  // =====================================================================
+  {
+    const { setMockScript } = await import("../src/lib/llm");
+    const LEAVE_TOOL_NAME = (await import("../src/lib/types")).LEAVE_SCENE_TOOL_NAME;
+
+    const lev = quietAI("Лев");
+    const maya = quietAI("Мая");
+    const yan = quietAI("Ян");
+
+    // Сцена из 2 ИИ: Лев уходит
+    const lv2 = createScene({
+      name: "Уход-из-двух",
+      setting: "",
+      config: { turnDelayMs: 10, maxTurns: 0 },
+      characterIds: [lev.id, maya.id],
+    });
+    await stopAllRunning();
+    setMockScript([{ name: LEAVE_TOOL_NAME, args: {} }]);
+    await engine.control(lv2.id, "step");
+    setMockScript(undefined);
+
+    assert(
+      listSceneEvents(lv2.id).some(
+        (e) =>
+          e.type === "action" &&
+          e.audience === "all" &&
+          (e.payload.calls ?? []).some((c) => c.toolName === LEAVE_TOOL_NAME && c.ok && c.observation.includes("уходит"))
+      ),
+      "уход объявлен всем наблюдением действия (без дубля-director)"
+    );
+    const leaveCall = listSceneEvents(lv2.id)
+      .flatMap((e) => e.payload.calls ?? [])
+      .find((c) => c.toolName === LEAVE_TOOL_NAME);
+    assert(!!leaveCall && leaveCall.ok, "leave_scene исполнился (ok:true)");
+    const rt2 = engine.getRuntime(lv2.id);
+    assert(
+      rt2.nextCharacterId === maya.id,
+      "ушедший выпал из ротации: ход переходит оставшейся"
+    );
+    // Уход одного из двух завершает сцену: общаться больше не с кем.
+    assert(getScene(lv2.id)!.status === "finished", "после ухода одного из двух сцена finished");
+    assert(
+      listSceneEvents(lv2.id).some(
+        (e) => e.type === "system" && (e.payload.message ?? "").includes("Сцена завершена")
+      ),
+      "системное событие о завершении сцены"
+    );
+    // Ушедший не возвращается при повторном запуске: флаг left_scene в БД.
+    let resurrectError = "";
+    try {
+      await engine.control(lv2.id, "start");
+    } catch (e) {
+      resurrectError = e instanceof Error ? e.message : String(e);
+    }
+    assert(getScene(lv2.id)!.status === "finished", "повторный старт не воскрешает ушедших");
+    assert(
+      resurrectError !== "" || engine.getRuntime(lv2.id).status === "finished",
+      "старт без собеседника отклонён или ничего не запускает"
+    );
+    engine.forget(lv2.id);
+
+    // Сцена из 3 ИИ: один уходит — сцена продолжается без него
+    const lv3 = createScene({
+      name: "Уход-из-трёх",
+      setting: "",
+      config: { turnDelayMs: 10, maxTurns: 0 },
+      characterIds: [lev.id, maya.id, yan.id],
+    });
+    await stopAllRunning();
+    setMockScript([{ name: LEAVE_TOOL_NAME, args: {} }]);
+    await engine.control(lv3.id, "step");
+    setMockScript(undefined);
+    assert(getScene(lv3.id)!.status !== "finished", "уход одного из трёх не завершает сцену");
+    const rt3 = engine.getRuntime(lv3.id);
+    assert(rt3.nextCharacterId !== lev.id && rt3.nextCharacterId !== null, "ротация продолжается без ушедшего");
+    await engine.control(lv3.id, "step");
+    assert(getScene(lv3.id)!.cursor === 2 && getScene(lv3.id)!.status === "paused", "оставшиеся ходят дальше");
+    engine.forget(lv3.id);
+  }
+
+  // =====================================================================
+  // Блок 7: block_character — обоюдное молчание; фильтрация событий
+  // =====================================================================
+  {
+    const { isPairBlocked, blockedIdsFor } = await import("../src/db/queries");
+    const { buildSystemPrompt } = await import("../src/lib/prompt");
+    const { setMockScript } = await import("../src/lib/llm");
+    const BLOCK_TOOL = (await import("../src/lib/types")).BLOCK_TOOL_NAME;
+
+    const arkadiy = quietAI("Аркадий");
+    const boris = quietAI("Борис");
+    const vadim = quietAI("Вадим");
+
+    // Сцена из 2 ИИ: блокировка завершает сцену (пар больше нет)
+    const bl2 = createScene({
+      name: "Блок-из-двух",
+      setting: "",
+      config: { turnDelayMs: 10, maxTurns: 0 },
+      characterIds: [arkadiy.id, boris.id],
+    });
+    engine.act(bl2.id, arkadiy.id, BLOCK_TOOL, { target: "Борис" });
+    assert(getScene(bl2.id)!.status === "finished", "блокировка в паре завершает сцену");
+    assert(
+      listSceneEvents(bl2.id).some(
+        (e) => e.type === "system" && (e.payload.message ?? "").includes("Сцена завершена")
+      ),
+      "записано системное событие о завершении"
+    );
+    assert(
+      listSceneEvents(bl2.id).some(
+        (e) => e.type === "director" && Array.isArray(e.audience) && (e.audience as number[]).includes(boris.id) &&
+          (e.payload.text ?? "").includes("заблокировал(а)")
+      ),
+      "заблокированный получил личное уведомление"
+    );
+    assert(isPairBlocked(bl2.id, arkadiy.id, boris.id), "пара числится заблокированной");
+    engine.forget(bl2.id);
+
+    // Сцена из 3 ИИ: Аркадий блокирует Бориса — сцена продолжается
+    const bl3 = createScene({
+      name: "Блок-из-трёх",
+      setting: "",
+      config: { turnDelayMs: 10, maxTurns: 0 },
+      characterIds: [arkadiy.id, boris.id, vadim.id],
+    });
+    await stopAllRunning();
+    setMockScript([{ name: BLOCK_TOOL, args: { target: "Борис" } }]);
+    await engine.control(bl3.id, "step");
+    setMockScript(undefined);
+    assert(getScene(bl3.id)!.status === "paused", "блокировка одного из трёх не завершает сцену");
+    // ВНИМАНИЕ: listSceneBlocks здесь не используется — она падает
+    // («no such column: id»: у scene_blocks составной PK без id-колонки,
+    // а запрос делает ORDER BY id). Это баг нового кода, см. отчёт;
+    // здесь проверяем рабочими isPairBlocked/blockedIdsFor.
+    assert(isPairBlocked(bl3.id, arkadiy.id, boris.id), "блокировка записана в сцену");
+
+    // Реплика заблокированного не доходит до заблокировавшего (фильтр движка)
+    engine.say(bl3.id, boris.id, "Аркадий, ты меня слышишь?");
+    await engine.control(bl3.id, "pause");
+    const blockedIds = blockedIdsFor(bl3.id, arkadiy.id);
+    assert(blockedIds.includes(boris.id), "blockedIdsFor включает заблокированного");
+    const rawVisible = getVisibleEvents(bl3.id, arkadiy.id, 100);
+    assert(
+      rawVisible.some((e) => e.type === "speech" && e.actorId === boris.id),
+      "сырая видимость содержит реплику (фильтр — на стороне движка)"
+    );
+    const filtered = rawVisible.filter((ev) => ev.actorId == null || !blockedIds.includes(ev.actorId));
+    assert(
+      !filtered.some((e) => e.type === "speech" && e.actorId === boris.id),
+      "после фильтра блокировок реплика Бориса не видна Аркадию"
+    );
+
+    // Секция блокировок в system prompt
+    const arkadyPrompt = buildSystemPrompt({
+      character: getCharacter(arkadiy.id)!,
+      scene: getScene(bl3.id)!,
+      participants: [getCharacter(arkadiy.id)!, getCharacter(boris.id)!, getCharacter(vadim.id)!],
+      events: [],
+      turn: 1,
+      blockedNames: ["Борис"],
+    });
+    assert(
+      arkadyPrompt.includes("# Блокировки") && arkadyPrompt.includes("Борис"),
+      "промпт содержит секцию блокировок с именем"
+    );
+    await engine.control(bl3.id, "stop");
+  }
+
+  // =====================================================================
+  // Блок 8: условия завершения сцены (finish) — доигрывание delayTurns
+  // =====================================================================
+  {
+    const { setMockScript } = await import("../src/lib/llm");
+
+    const fedya = quietAI("Фёдор", [
+      createTool({
+        name: "kiss_fin",
+        title: "Поцелуй",
+        description: "Поцелуй",
+        parametersSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] },
+        audience: "target",
+        targetParam: "to",
+        observationTemplate: "{name} целует {to}",
+        effects: [],
+      }).id,
+    ]);
+    const zoya = quietHuman("Зоя");
+    const finScene = createScene({
+      name: "Авто-финиш",
+      setting: "",
+      config: {
+        turnDelayMs: 10,
+        maxTurns: 0,
+        finish: {
+          conditions: [{ type: "toolCall", toolName: "kiss_fin", characterId: fedya.id }],
+          delayTurns: 2,
+        },
+      },
+      characterIds: [fedya.id, zoya.id],
+    });
+
+    await stopAllRunning();
+    setMockScript([{ name: "kiss_fin", args: { to: "Зоя" } }]);
+    await engine.control(finScene.id, "start");
+    const finDeadline = Date.now() + 15000;
+    while (Date.now() < finDeadline && getScene(finScene.id)!.status !== "finished") {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    setMockScript(undefined);
+
+    const finEvents = listSceneEvents(finScene.id);
+    assert(getScene(finScene.id)!.status === "finished", "сцена завершилась по условиям finish");
+    assert(
+      finEvents.some((e) => e.type === "system" && (e.payload.message ?? "").includes("Условия завершения сцены достигнуты")),
+      "записано событие о достижении условий"
+    );
+    assert(
+      finEvents.some((e) => e.type === "system" && (e.payload.message ?? "").includes("Сцена завершена: условия завершения выполнены")),
+      "записано событие о завершении по условиям"
+    );
+    const kissTurn = finEvents.find(
+      (e) => e.type === "action" && (e.payload.calls ?? []).some((c) => c.toolName === "kiss_fin")
+    )!.turn;
+    assert(
+      getScene(finScene.id)!.cursor >= kissTurn + 2,
+      `после поцелуя доиграно ≥2 хода (cursor ${getScene(finScene.id)!.cursor}, поцелуй на ходу ${kissTurn})`
+    );
+    engine.forget(finScene.id);
+  }
+
+  // =====================================================================
+  // Блок 9: комбо — скрытая последовательность, секрет для knowers
+  // =====================================================================
+  {
+    const { createCombo } = await import("../src/db/queries");
+    const { buildSystemPrompt } = await import("../src/lib/prompt");
+
+    const mkTargetTool = (name: string, title: string) =>
+      createTool({
+        name,
+        title,
+        description: title,
+        parametersSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] },
+        audience: "target",
+        targetParam: "to",
+        observationTemplate: `{name}: ${title} для {to}`,
+        effects: [],
+      });
+    const hugC = mkTargetTool("hug_c", "Обнять");
+    const kissC = mkTargetTool("kiss_c", "Поцеловать");
+
+    const grisha = quietHuman("Гриша", [hugC.id, kissC.id]);
+    const dasha = quietHuman("Даша");
+    updChar2(dasha.id, { state: { mood: 3 } });
+    const combo = createCombo({
+      name: "tender_combo",
+      title: "Нежность",
+      description: "Обнять и поцеловать — и настроение взлетает.",
+      steps: [{ toolName: "hug_c" }, { toolName: "kiss_c" }],
+      windowTurns: 10,
+      effects: [{ target: "tool_target", key: "mood", op: "add", value: 2 }],
+      knowers: [dasha.id],
+      announce: false,
+    });
+    const cScene = createScene({
+      name: "Комбо",
+      setting: "",
+      config: { turnDelayMs: 10 },
+      characterIds: [grisha.id, dasha.id],
+    });
+
+    engine.act(cScene.id, grisha.id, "hug_c", { to: "Даша" });
+    assert((getCharacter(dasha.id)!.state.mood as number) === 3, "первый шаг комбо сам по себе без эффекта");
+    const kissAct = engine.act(cScene.id, grisha.id, "kiss_c", { to: "Даша" });
+    assert(kissAct.ok, "второй шаг прошёл");
+    assert(
+      ((kissAct.event.payload.calls ?? [])[0]?.result ?? "").includes("Комбо"),
+      "в событие актёра дописано уведомление о сработавшем комбо"
+    );
+    assert(
+      (getCharacter(dasha.id)!.state.mood as number) === 5,
+      "эффекты комбо применились к цели (mood 3 → 5)"
+    );
+    const comboEvents = listSceneEvents(cScene.id).filter(
+      (e) => e.type === "director" && e.payload.comboId === combo.id
+    );
+    assert(comboEvents.length === 1, "комбо-событие записано ровно одно");
+    assert(
+      Array.isArray(comboEvents[0]!.audience) && (comboEvents[0]!.audience as number[]).includes(grisha.id),
+      "комбо-событие адресовано исполнителю"
+    );
+    assert(
+      (comboEvents[0]!.payload.text ?? "").includes("Комбо"),
+      "текст события называет комбо"
+    );
+
+    // Секрет комбо виден только знающим (knowers)
+    const dashaPrompt = buildSystemPrompt({
+      character: getCharacter(dasha.id)!,
+      scene: getScene(cScene.id)!,
+      participants: [getCharacter(grisha.id)!, getCharacter(dasha.id)!],
+      events: [],
+      turn: 1,
+      comboSecrets: [{ title: combo.title, description: combo.description, steps: combo.steps.map((s) => s.toolName) }],
+    });
+    assert(dashaPrompt.includes("Твои секреты"), "промпт знающего содержит «Твои секреты»");
+    assert(dashaPrompt.includes("hug_c"), "секрет раскрывает порядок шагов");
+
+    // Повтор той же цепочки — комбо не срабатывает второй раз
+    engine.act(cScene.id, grisha.id, "hug_c", { to: "Даша" });
+    engine.act(cScene.id, grisha.id, "kiss_c", { to: "Даша" });
+    assert(
+      (getCharacter(dasha.id)!.state.mood as number) === 5,
+      "повторная цепочка не даёт эффект повторно"
+    );
+    assert(
+      listSceneEvents(cScene.id).filter((e) => e.payload.comboId === combo.id).length === 1,
+      "второго комбо-события нет (один раз за сцену)"
+    );
+
+    // Комбо с фильтром цели: шаги засчитываются только когда их делают
+    // НА Дашу. Обратное направление (Даша — Грише) не замыкает цепочку.
+    // Свежие тулы — чтобы цепочку не замкнул случайно другой комбо без фильтров.
+    {
+      const hugT = mkTargetTool("hug_t", "Обнять (тест цели)");
+      const kissT = mkTargetTool("kiss_t", "Поцеловать (тест цели)");
+      updChar2(grisha.id, { toolIds: [hugC.id, kissC.id, hugT.id, kissT.id] });
+      updChar2(dasha.id, { toolIds: [hugC.id, kissC.id, hugT.id, kissT.id] });
+      const combo2 = createCombo({
+        name: "targeted_combo",
+        title: "Направленная нежность",
+        description: "Только когда всё это делают с Дашей.",
+        steps: [
+          { toolName: "hug_t", targetName: "Даша" },
+          { toolName: "kiss_t", targetName: "Даша" },
+        ],
+        windowTurns: 10,
+        effects: [{ target: "tool_target", key: "mood", op: "add", value: 1 }],
+        knowers: [],
+        announce: true,
+      });
+      const c2 = createScene({
+        name: "Комбо с целью",
+        setting: "",
+        config: { turnDelayMs: 10 },
+        characterIds: [grisha.id, dasha.id],
+      });
+      // Даша делает оба шага Грише — не то направление, комбо не срабатывает
+      engine.act(c2.id, dasha.id, "hug_t", { to: "Гриша" });
+      const wrongDir = engine.act(c2.id, dasha.id, "kiss_t", { to: "Гриша" });
+      assert(
+        !wrongDir.result.includes("Комбо"),
+        "цепочка в обратную сторону (цель — не Даша) не срабатывает"
+      );
+      assert(
+        listSceneEvents(c2.id).every((e) => e.payload.comboId !== combo2.id),
+        "комбо-события направленного комбо пока нет"
+      );
+      // Гриша делает то же самое С Дашей — срабатывает, анонс всем
+      engine.act(c2.id, grisha.id, "hug_t", { to: "Даша" });
+      const rightDir = engine.act(c2.id, grisha.id, "kiss_t", { to: "Даша" });
+      assert(rightDir.result.includes("Комбо"), "цепочка с нужной целью сработала");
+      const announce = listSceneEvents(c2.id).find(
+        (e) => e.type === "director" && e.payload.comboId === combo2.id
+      );
+      assert(
+        !!announce && announce.audience === "all",
+        "announce-комбо объявлено всем участникам (событие мира)"
+      );
+    }
+
+    // Комбо замыкается исполнением по согласию: kiss_c2 — тул-предложение,
+    // Гриша предлагает, Даша принимает — и это последний шаг цепочки.
+    {
+      const { updateTool } = await import("../src/db/queries");
+      const kiss2 = createTool({
+        name: "kiss_c2",
+        title: "Поцеловать (согласие)",
+        description: "Поцелуй по согласию",
+        parametersSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] },
+        audience: "target",
+        targetParam: "to",
+        observationTemplate: "{name} целует {to}",
+        effects: [],
+        requiresConsent: true,
+      });
+      updChar2(grisha.id, { toolIds: [hugC.id, kissC.id, kiss2.id] });
+      const combo3 = createCombo({
+        name: "consent_combo",
+        title: "С согласия",
+        description: "Обнять, а поцелуй — по согласию.",
+        steps: [
+          { toolName: "hug_c", targetName: "Даша" },
+          { toolName: "kiss_c2", targetName: "Даша" },
+        ],
+        windowTurns: 10,
+        effects: [{ target: "tool_target", key: "mood", op: "add", value: 1 }],
+        knowers: [],
+        announce: false,
+      });
+      const c3 = createScene({
+        name: "Комбо по согласию",
+        setting: "",
+        config: { turnDelayMs: 10 },
+        characterIds: [grisha.id, dasha.id],
+      });
+      engine.act(c3.id, grisha.id, "hug_c", { to: "Даша" });
+      const prop = engine.act(c3.id, grisha.id, "kiss_c2", { to: "Даша" });
+      assert(prop.ok && prop.result.includes("Предложение"), "kiss_c2 стал предложением");
+      // Оффер виден Даше; находим id через список её актуальных предложений
+      const { listPendingOffersForCharacter } = await import("../src/db/queries");
+      const pending = listPendingOffersForCharacter(c3.id, dasha.id);
+      assert(pending.length === 1, "у Даши одно висящее предложение");
+      const resp = engine.act(c3.id, dasha.id, "respond_to_offer", {
+        offer: String(pending[0]!.id),
+        decision: "accept",
+      });
+      assert(resp.ok, "Даша согласилась");
+      assert(
+        (resp.result as string).includes("Комбо"),
+        "комбо сработало на исполнении по согласию (дофикс: не срабатывало вовсе)"
+      );
+      assert(
+        listSceneEvents(c3.id).some((e) => e.payload.comboId === combo3.id),
+        "комбо-событие записано"
+      );
+      void updateTool;
+    }
+
+    // Шум между шагами (реплики, посторонние тулы, чужие вызовы не туда)
+    // не рвёт цепочку: хвост ищется по проекции на релевантные вызовы.
+    {
+      const combo4 = createCombo({
+        name: "noisy_combo",
+        title: "Сквозь шум",
+        description: "Обнять и поцеловать Дашу — даже если между этим болтовня.",
+        steps: [
+          { toolName: "hug_t", targetName: "Даша" },
+          { toolName: "kiss_t", targetName: "Даша" },
+        ],
+        windowTurns: 10,
+        effects: [{ target: "tool_target", key: "mood", op: "add", value: 1 }],
+        knowers: [],
+        announce: false,
+      });
+      const c4 = createScene({
+        name: "Комбо сквозь шум",
+        setting: "",
+        config: { turnDelayMs: 10 },
+        characterIds: [grisha.id, dasha.id],
+      });
+      // В предыдущем блоке Грише сузили toolIds — вернём тулы этого комбо
+      const { listTools } = await import("../src/db/queries");
+      const hugT2 = listTools().find((t) => t.name === "hug_t")!;
+      const kissT2 = listTools().find((t) => t.name === "kiss_t")!;
+      updChar2(grisha.id, { toolIds: [hugC.id, kissC.id, hugT2.id, kissT2.id] });
+      engine.act(c4.id, grisha.id, "say", { phrase: "разговор ни о чём" });
+      engine.act(c4.id, grisha.id, "hug_t", { to: "Даша" });
+      engine.act(c4.id, grisha.id, "say", { phrase: "ещё немного разговоров" });
+      // чужой вызов «не туда» (Даша → Гриша) тоже не должен рвать цепочку
+      engine.act(c4.id, dasha.id, "hug_t", { to: "Гриша" });
+      const noisy = engine.act(c4.id, grisha.id, "kiss_t", { to: "Даша" });
+      assert(
+        noisy.result.includes("Комбо"),
+        "шум между шагами и чужой вызов не туда не рвут цепочку"
+      );
+      assert(
+        listSceneEvents(c4.id).some((e) => e.payload.comboId === combo4.id),
+        "комбо сквозь шум сработало и записано"
+      );
+    }
+  }
+
+  // =====================================================================
+  // Блок 10: гардероб — эффекты ношения/снятия, wear, покупка одежды
+  // =====================================================================
+  {
+    const {
+      updateClothingSlot,
+      getClothingSlot,
+      createGarment,
+      listCharacterGarments,
+      addGarmentToCharacter,
+    } = await import("../src/db/queries");
+    const { dressCharacter } = await import("../src/lib/wardrobe");
+    const { UNDRESS_TOOL_NAME, WEAR_TOOL_NAME } = await import("../src/lib/types");
+
+    // Слот белья получает эффекты «пустого слота» (беспокойство)
+    const uwSlot = getClothingSlot("underwear")!;
+    updateClothingSlot("underwear", {
+      slot: "underwear",
+      layer: uwSlot.layer,
+      undressPlaces: uwSlot.undressPlaces,
+      bareEffects: [{ target: "self", key: "anxiety", op: "add", value: 1 }],
+      position: uwSlot.position,
+    });
+
+    const lace = createGarment({
+      name: "Кружевное бельё",
+      emoji: "🩲",
+      description: "Красивое бельё",
+      slot: "underwear",
+      effects: [{ target: "self", key: "mood", op: "add", value: 1 }],
+      price: 0,
+    });
+    const vera = quietHuman("Вера");
+    const glasha = quietHuman("Глаша");
+    updChar2(vera.id, { state: { money: 100, mood: 4, anxiety: 0 } });
+
+    const dressed = dressCharacter(vera.id, lace.id);
+    assert(dressed.ok, `гардероб-надевание прошло (${dressed.message})`);
+    // Выдаём предмет во владение: без записи в character_garments
+    // undress в сцене не найдёт эффекты предмета (см. отчёт).
+    addGarmentToCharacter(vera.id, lace.id);
+    assert(
+      (getCharacter(vera.id)!.state.worn_underwear as string) === "Кружевное бельё",
+      "worn_underwear заполнен названием"
+    );
+    assert((getCharacter(vera.id)!.state.mood as number) === 5, "эффект ношения: mood 4 → 5");
+    assert((getCharacter(vera.id)!.state.anxiety as number) === -1, "пустой слот погашен: anxiety 0 → −1");
+
+    const wScene = createScene({
+      name: "Гардероб",
+      setting: "",
+      config: { turnDelayMs: 10, place: "дом" },
+      characterIds: [vera.id, glasha.id],
+    });
+
+    // Снятие: эффекты предмета обратно, эффекты пустого слота вступают
+    const und = engine.act(wScene.id, vera.id, UNDRESS_TOOL_NAME, { slot: "underwear" });
+    assert(und.ok, "undress прошёл (место дом, верхнее не надето)");
+    assert((getCharacter(vera.id)!.state.worn_underwear as string) === "", "слот опустел");
+    assert(
+      (getCharacter(vera.id)!.state.carried_underwear as string) === "Кружевное бельё",
+      "снятое при себе (carried_underwear)"
+    );
+    assert((getCharacter(vera.id)!.state.mood as number) === 4, "эффект предмета ушёл: mood 5 → 4");
+    assert(
+      (getCharacter(vera.id)!.state.anxiety as number) === 0,
+      "bareEffects вступили: anxiety −1 → 0 (+1)"
+    );
+
+    // Надевание обратно возвращает всё как было
+    const wore = engine.act(wScene.id, vera.id, WEAR_TOOL_NAME, { slot: "underwear" });
+    assert(wore.ok, "wear вернул предмет");
+    assert(
+      (getCharacter(vera.id)!.state.worn_underwear as string) === "Кружевное бельё" &&
+        (getCharacter(vera.id)!.state.carried_underwear as string) === "",
+      "предмет снова надет, carried пуст"
+    );
+    assert((getCharacter(vera.id)!.state.mood as number) === 5, "эффект ношения восстановлен");
+    assert((getCharacter(vera.id)!.state.anxiety as number) === -1, "эффект пустого слота снова погашен");
+
+    // Покупка одежды: деньги → гардероб → сразу надета
+    const robe = createGarment({
+      name: "Шёлковый халат",
+      emoji: "🥋",
+      description: "Уютный халат",
+      slot: "top",
+      effects: [{ target: "self", key: "mood", op: "add", value: 2 }],
+      price: 30,
+    });
+    const buy = engine.act(wScene.id, vera.id, "shop_buy", { item: "Шёлковый халат" });
+    assert(buy.ok, "покупка одежды прошла");
+    assert((getCharacter(vera.id)!.state.money as number) === 70, "деньги списаны: 100 − 30 = 70");
+    assert(
+      listCharacterGarments(vera.id).some((g) => g.id === robe.id),
+      "предмет добавлен в гардероб владелицы"
+    );
+    assert((getCharacter(vera.id)!.state.worn_top as string) === "Шёлковый халат", "купленная одежда сразу надета");
+    assert((getCharacter(vera.id)!.state.mood as number) === 7, "эффекты купленной одежды применились (mood 5 → 7)");
+  }
+
+  // =====================================================================
+  // Блок 11: переименование места — каскад по всем ссылкам
+  // =====================================================================
+  {
+    const {
+      updatePlace,
+      UniqueConflictError,
+      updateCharacter: updChar11,
+      getClothingSlot,
+      updateClothingSlot,
+      listPlaces,
+    } = await import("../src/db/queries");
+
+    // «кафе» уже есть (Фаза «Места»); заводим все четыре вида ссылок
+    const cascadeScene = createScene({
+      name: "Каскад-место",
+      setting: "",
+      config: { place: "кафе" },
+      characterIds: [yana.id],
+    });
+    const uwSlot11 = getClothingSlot("underwear")!;
+    updateClothingSlot("underwear", {
+      slot: "underwear",
+      layer: uwSlot11.layer,
+      undressPlaces: ["дом", "кафе"],
+      bareEffects: uwSlot11.bareEffects,
+      position: uwSlot11.position,
+    });
+    const robert = quietHuman("Роберт");
+    updChar11(robert.id, {
+      boundaries: [
+        { toolName: "kiss_b", minRelation: null, minMood: null, requirePlace: "кафе", requireAttr: null, refusalText: "", effects: [] },
+      ],
+    });
+    const placeTool = createTool({
+      name: "place_probe",
+      title: "Проверка места",
+      description: "Тест каскада",
+      parametersSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] },
+      audience: "target",
+      targetParam: "to",
+      observationTemplate: "{name} проверяет место у {to}",
+      effects: [],
+      outcomes: [
+        {
+          id: "at_cafe",
+          title: "В кафе",
+          conditions: [{ kind: "place" as const, key: "", op: "=" as const, value: "кафе" }],
+          effects: [],
+          noticeTarget: "",
+          hideFromPrompt: false,
+        },
+      ],
+    });
+
+    const renamed = updatePlace("кафе", { name: "кофейня" });
+    assert(renamed?.name === "кофейня", "место переименовано");
+    assert(
+      getScene(cascadeScene.id)!.config.place === "кофейня",
+      "каскад: config.place сцены переписан"
+    );
+    assert(
+      getClothingSlot("underwear")!.undressPlaces.includes("кофейня") &&
+        !getClothingSlot("underwear")!.undressPlaces.includes("кафе"),
+      "каскад: undressPlaces слота переписаны"
+    );
+    assert(
+      (getCharacter(robert.id)!.boundaries[0]!.conditions ?? []).some(
+        (c) => c.kind === "place" && c.place === "кофейня"
+      ),
+      "каскад: requirePlace границы переписан (условие kind:place)"
+    );
+    assert(
+      getToolByName("place_probe")!.outcomes[0]!.conditions[0]!.value === "кофейня",
+      "каскад: условие исхода kind:place переписано"
+    );
+
+    // Переименование в существующее имя — ошибка уникальности, ничего не меняется
+    let conflict: unknown = null;
+    try {
+      updatePlace("кофейня", { name: "отель" });
+    } catch (e) {
+      conflict = e;
+    }
+    assert(conflict instanceof UniqueConflictError, "коллизия имён бросает UniqueConflictError");
+    assert(
+      listPlaces().some((p) => p.name === "кофейня"),
+      "при коллизии ничего не переименовалось"
+    );
+  }
+
+  // =====================================================================
+  // Блок 12: reveal неизвестной характеристики — ошибка со списком реестра
+  // =====================================================================
+  {
+    const { executeReveal } = await import("../src/lib/knowledge");
+
+    const revealRes = executeReveal({
+      actor: getCharacter(yana.id)!,
+      participants: [getCharacter(yana.id)!],
+      args: { attribute: "чушь", value: 5 },
+    });
+    assert(!revealRes.ok, "неизвестная характеристика отклонена");
+    assert(
+      revealRes.result.includes("Неизвестная характеристика"),
+      "ошибка называет проблему"
+    );
+    assert(
+      revealRes.result.includes("height"),
+      `ошибка перечисляет ключи реестра (получено: ${revealRes.result.slice(0, 140)})`
+    );
+  }
+
+  // =====================================================================
+  // Блок 13: мысли приватны — текст без тула чужим не доставляется
+  // =====================================================================
+  {
+    const nika = quietAI("Никанор");
+    const sera = quietAI("Серафима");
+    const thScene = createScene({
+      name: "Мысли-приватны",
+      setting: "",
+      config: { turnDelayMs: 10, maxTurns: 1 },
+      characterIds: [nika.id, sera.id],
+    });
+    await stopAllRunning();
+    // У Никанора нет тулов: эвристика мока возвращает чистый текст без
+    // tool_calls — это «мысль», никаких инструментов за ход.
+    await engine.control(thScene.id, "start");
+    const thDeadline = Date.now() + 10000;
+    while (Date.now() < thDeadline && getScene(thScene.id)!.status !== "finished") {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    const thEvents = listSceneEvents(thScene.id);
+    const thought = thEvents.find((e) => e.type === "speech" && e.actorId === nika.id);
+    assert(!!thought, "мысль записана speech-событием за актёром");
+    assert(
+      (thought!.payload.text ?? "").includes("продолжаю разговор"),
+      "текст мысли — ровно то, что модель вернула без тула"
+    );
+    const thParts = [getCharacter(nika.id)!, getCharacter(sera.id)!];
+    const seraMsgs = buildMessages({
+      character: getCharacter(sera.id)!,
+      scene: getScene(thScene.id)!,
+      participants: thParts,
+      events: getVisibleEvents(thScene.id, sera.id, 100),
+      turn: 99,
+    });
+    assert(
+      !seraMsgs.some((m) => (m.content ?? "").includes("продолжаю разговор")),
+      "мысли Никанора не попадают в сообщения Серафимы (приватны)"
+    );
+    assert(
+      getVisibleEvents(thScene.id, sera.id, 100).some((e) => e.id === thought!.id),
+      "сырая видимость содержит событие-мысль (фильтр — на реконструкции)"
+    );
+    const nikaMsgs = buildMessages({
+      character: getCharacter(nika.id)!,
+      scene: getScene(thScene.id)!,
+      participants: thParts,
+      events: getVisibleEvents(thScene.id, nika.id, 100),
+      turn: 99,
+    });
+    assert(
+      nikaMsgs.some(
+        (m) => m.role === "assistant" && (m.content ?? "").includes("продолжаю разговор")
+      ),
+      "автор видит свои мысли в своей истории (assistant-контент)"
+    );
+    // Правила мира объясняют модель: текст без тула = мысли, общение тулами.
+    const thPrompt = seraMsgs[0].content ?? "";
+    assert(thPrompt.includes("ВНУТРЕННИЕ МЫСЛИ"), "правила объявляют текст без тула мыслями");
+    assert(
+      thPrompt.includes("say") && thPrompt.includes("text_message"),
+      "правила называют тулы общения say/text_message"
+    );
+    checkProtocol(thScene.id, sera.id, "Серафима-мысли");
+  }
+
+  // =====================================================================
+  // Блок 14: say — фраза вслух (всем или адресату), ошибки аргументов
+  // =====================================================================
+  {
+    const alb = quietHuman("Альберт");
+    const bri = quietHuman("Бриджит");
+    const sayScene = createScene({
+      name: "Say-вслух",
+      setting: "",
+      config: { turnDelayMs: 10 },
+      characterIds: [alb.id, bri.id],
+    });
+    const sayParts = () => [getCharacter(alb.id)!, getCharacter(bri.id)!];
+
+    const said = engine.act(sayScene.id, alb.id, "say", { phrase: "Вечер хорош, не правда ли?" });
+    assert(said.ok, "say без адресата исполнился (ok:true)");
+    const saidCall = (said.event.payload.calls ?? [])[0]!;
+    assert(saidCall.ok && saidCall.audience === "all", "say вслух слышат все (аудитория all)");
+    assert(
+      saidCall.observation.includes("Альберт: «Вечер хорош, не правда ли?»"),
+      `наблюдение say — фраза от лица актёра (получено: ${saidCall.observation})`
+    );
+    const briMsgs = buildMessages({
+      character: getCharacter(bri.id)!,
+      scene: getScene(sayScene.id)!,
+      participants: sayParts(),
+      events: getVisibleEvents(sayScene.id, bri.id, 100),
+      turn: 99,
+    });
+    assert(
+      briMsgs.some(
+        (m) => m.role === "user" && (m.content ?? "").includes("Вечер хорош, не правда ли?")
+      ),
+      "фраза вслух дошла до слушателя как user-сообщение"
+    );
+
+    const saidTo = engine.act(sayScene.id, alb.id, "say", {
+      phrase: "Бриджит, это для тебя",
+      to: "Бриджит",
+    });
+    assert(saidTo.ok, "say с адресатом исполнился");
+    const toCall = (saidTo.event.payload.calls ?? [])[0]!;
+    assert(
+      Array.isArray(toCall.audience) &&
+        (toCall.audience as number[]).length === 1 &&
+        (toCall.audience as number[])[0] === bri.id,
+      "адресный say слышит только адресата"
+    );
+    assert(
+      toCall.observation.includes("Бриджит") && toCall.observation.includes("это для тебя"),
+      "наблюдение адресного say называет адресата"
+    );
+
+    const badTo = engine.act(sayScene.id, alb.id, "say", { phrase: "Эй!", to: "Несуществующий" });
+    assert(!badTo.ok, "say с неизвестным адресатом отклонён");
+    assert(
+      badTo.result.includes("не найден среди участников") && badTo.result.includes("Бриджит"),
+      `ошибка say перечисляет участников (получено: ${badTo.result.slice(0, 110)})`
+    );
+
+    const empty = engine.act(sayScene.id, alb.id, "say", { phrase: "   " });
+    assert(!empty.ok && empty.result.includes("Пустая фраза"), "пустая фраза say отклонена");
+
+    // Свой say в своей истории — tool_calls + tool-ответ (протокол не рвётся)
+    const albMsgs = buildMessages({
+      character: getCharacter(alb.id)!,
+      scene: getScene(sayScene.id)!,
+      participants: sayParts(),
+      events: getVisibleEvents(sayScene.id, alb.id, 100),
+      turn: 99,
+    });
+    assert(
+      albMsgs.some(
+        (m) => m.role === "assistant" && (m.tool_calls ?? []).some((tc) => tc.function.name === "say")
+      ),
+      "свой say реконструирован актёру как tool_calls"
+    );
+    checkProtocol(sayScene.id, alb.id, "Альберт-say");
+  }
+
+  // =====================================================================
+  // Блок 15: text_message — переписка, видит только получатель
+  // =====================================================================
+  {
+    const tar = quietHuman("Тарас");
+    const uly = quietHuman("Уля");
+    const fek = quietHuman("Фёкла");
+    const tmScene = createScene({
+      name: "Text_message",
+      setting: "",
+      config: { turnDelayMs: 10 },
+      characterIds: [tar.id, uly.id, fek.id],
+    });
+    const tmParts = () => [getCharacter(tar.id)!, getCharacter(uly.id)!, getCharacter(fek.id)!];
+
+    const sent = engine.act(tmScene.id, tar.id, "text_message", {
+      to: "Уля",
+      text: "увидел твоё объявление",
+    });
+    assert(sent.ok, "text_message доставлен (ok:true)");
+    const sentCall = (sent.event.payload.calls ?? [])[0]!;
+    assert(
+      Array.isArray(sentCall.audience) &&
+        (sentCall.audience as number[]).length === 1 &&
+        (sentCall.audience as number[])[0] === uly.id,
+      "сообщение адресовано только получателю"
+    );
+    assert(
+      Array.isArray(sent.event.audience) &&
+        sent.event.audience.length === 1 &&
+        (sent.event.audience as number[])[0] === uly.id,
+      "событие переписки адресовано только получателю"
+    );
+    assert(
+      sentCall.observation.includes("📱 Тарас: «увидел твоё объявление»"),
+      `наблюдение переписки оформлено как сообщение чата (получено: ${sentCall.observation})`
+    );
+    const ulyMsgs = buildMessages({
+      character: getCharacter(uly.id)!,
+      scene: getScene(tmScene.id)!,
+      participants: tmParts(),
+      events: getVisibleEvents(tmScene.id, uly.id, 100),
+      turn: 99,
+    });
+    assert(
+      ulyMsgs.some(
+        (m) => m.role === "user" && (m.content ?? "").includes("увидел твоё объявление")
+      ),
+      "получатель видит сообщение в reconstructed-контексте"
+    );
+    const fekMsgs = buildMessages({
+      character: getCharacter(fek.id)!,
+      scene: getScene(tmScene.id)!,
+      participants: tmParts(),
+      events: getVisibleEvents(tmScene.id, fek.id, 100),
+      turn: 99,
+    });
+    assert(
+      !fekMsgs.some((m) => (m.content ?? "").includes("увидел твоё объявление")),
+      "третьему участнику переписка не видна"
+    );
+
+    const badTm = engine.act(tmScene.id, tar.id, "text_message", { to: "Марс", text: "зиг" });
+    assert(!badTm.ok, "неизвестный получатель отклонён");
+    assert(
+      badTm.result.includes("не найден среди участников") && badTm.result.includes("Уля"),
+      "ошибка переписки перечисляет участников"
+    );
+
+    const noText = engine.act(tmScene.id, tar.id, "text_message", { to: "Уля", text: "" });
+    assert(!noText.ok && noText.result.includes("Пустое сообщение"), "сообщение без текста отклонено");
+    checkProtocol(tmScene.id, uly.id, "Уля-text_message");
+  }
+
+  // =====================================================================
+  // Блок 16: режиссёр = мир/мысль — без фигуры «Режиссёра» в промпте
+  // =====================================================================
+  {
+    const geo = quietHuman("Георг");
+    const xen = quietHuman("Ксения");
+    const dirScene = createScene({
+      name: "Директор-мысль",
+      setting: "",
+      config: { turnDelayMs: 10 },
+      characterIds: [geo.id, xen.id],
+    });
+    engine.inject(dirScene.id, "В дверь постучали", "all");
+    engine.inject(dirScene.id, "Ксения, за стеной кто-то поёт", [xen.id]);
+
+    const dirParts = [getCharacter(geo.id)!, getCharacter(xen.id)!];
+    const xenMsgs = buildMessages({
+      character: getCharacter(xen.id)!,
+      scene: getScene(dirScene.id)!,
+      participants: dirParts,
+      events: getVisibleEvents(dirScene.id, xen.id, 100),
+      turn: 99,
+    });
+    assert(
+      xenMsgs.some((m) => (m.content ?? "").includes("[Событие мира]: В дверь постучали")),
+      "широковещательный director виден как [Событие мира]"
+    );
+    assert(
+      xenMsgs.some((m) =>
+        (m.content ?? "").includes("[Тебе в голову пришла мысль]: Ксения, за стеной кто-то поёт")
+      ),
+      "личный director виден как [Тебе в голову пришла мысль]"
+    );
+    const xenText = xenMsgs.map((m) => m.content ?? "").join("\n");
+    assert(!xenText.includes("Режиссёр"), "фигура режиссёра в промпте не упоминается");
+
+    const geoMsgs = buildMessages({
+      character: getCharacter(geo.id)!,
+      scene: getScene(dirScene.id)!,
+      participants: dirParts,
+      events: getVisibleEvents(dirScene.id, geo.id, 100),
+      turn: 99,
+    });
+    assert(
+      geoMsgs.some((m) => (m.content ?? "").includes("[Событие мира]: В дверь постучали")) &&
+        !geoMsgs.some((m) => (m.content ?? "").includes("за стеной кто-то поёт")),
+      "мировое событие приходит всем, личная мысль Ксении — только ей"
+    );
+  }
+
+  // =====================================================================
+  // Блок 17: гардероб агента — wardrobe_browse и wear_garment
+  // =====================================================================
+  {
+    const { createGarment, addGarmentToCharacter } = await import("../src/db/queries");
+    const { dressCharacter } = await import("../src/lib/wardrobe");
+    const { WARDROBE_BROWSE_TOOL_NAME, WEAR_GARMENT_TOOL_NAME } = await import("../src/lib/types");
+
+    const toma = quietHuman("Тома", [], { money: 50, mood: 4 });
+    const zlata = quietHuman("Злата");
+    const sweater = createGarment({
+      name: "Домашний свитер",
+      emoji: "🧶",
+      description: "Тёплый свитер",
+      slot: "top",
+      effects: [{ target: "self", key: "mood", op: "add", value: 1 }],
+      price: 0,
+    });
+    const gown = createGarment({
+      name: "Вечернее платье",
+      emoji: "👗",
+      description: "Платье для выхода",
+      slot: "top",
+      effects: [
+        { target: "self", key: "mood", op: "add", value: 3 },
+        { target: "self", key: "charisma", op: "add", value: 1 },
+      ],
+      price: 0,
+    });
+    addGarmentToCharacter(toma.id, sweater.id);
+    addGarmentToCharacter(toma.id, gown.id);
+    const dressed0 = dressCharacter(toma.id, sweater.id);
+    assert(dressed0.ok, `начальная одежда надета редактором (${dressed0.message})`);
+    assert((getCharacter(toma.id)!.state.worn_top as string) === "Домашний свитер", "worn_top — свитер");
+    assert((getCharacter(toma.id)!.state.mood as number) === 5, "эффект свитера применился (mood 4 → 5)");
+
+    const gwScene = createScene({
+      name: "Гардероб-агента",
+      setting: "",
+      config: { turnDelayMs: 10, place: "дом" },
+      characterIds: [toma.id, zlata.id],
+    });
+
+    // Витрина личного гардероба
+    const browse = engine.act(gwScene.id, toma.id, WARDROBE_BROWSE_TOOL_NAME, {});
+    assert(browse.ok, "wardrobe_browse исполнился (ok:true)");
+    const browseCall = (browse.event.payload.calls ?? [])[0]!;
+    assert(
+      Array.isArray(browseCall.audience) &&
+        (browseCall.audience as number[]).length === 1 &&
+        (browseCall.audience as number[])[0] === toma.id,
+      "витрина гардероба видна только владелице"
+    );
+    assert(
+      browse.result.includes("надето «Домашний свитер»") && browse.result.includes("Вечернее платье"),
+      "витрина перечисляет надетое и содержимое шкафа"
+    );
+    assert(browse.result.includes("wear_garment"), "витрина подсказывает тул переодевания");
+
+    // Переодевание: старое — в шкаф (эффекты снялись), новое — надето
+    const change = engine.act(gwScene.id, toma.id, WEAR_GARMENT_TOOL_NAME, { garment: "Вечернее платье" });
+    assert(change.ok, "wear_garment переодел владелицу (ok:true)");
+    const chCall = (change.event.payload.calls ?? [])[0]!;
+    assert(
+      chCall.observation.includes("переодевается") &&
+        chCall.observation.includes("Домашний свитер") &&
+        chCall.observation.includes("Вечернее платье"),
+      `наблюдение переодевания называет старое и новое (получено: ${chCall.observation})`
+    );
+    assert(chCall.observation !== "" && chCall.audience === "all", "переодевание — публичное действие");
+    const tAfter = getCharacter(toma.id)!;
+    assert((tAfter.state.worn_top as string) === "Вечернее платье", "worn_top переключён на платье");
+    assert((tAfter.state.carried_top as string) === "", "старый предмет вернулся в шкаф (не carried)");
+    assert(
+      (tAfter.state.mood as number) === 7,
+      "эффекты обратимы: −1 свитер, +3 платье (mood 5 → 7)"
+    );
+    assert((tAfter.state.charisma as number) === 1, "платье добавило харизму (+1)");
+    assert(
+      (change.event.payload.stateChanges ?? []).some((c) => c.characterId === toma.id && c.key === "mood"),
+      "изменения самочувствия записаны в событие (stateChanges)"
+    );
+
+    // Чужое/несуществующее — отказ со списком своего
+    const notOwned = engine.act(gwScene.id, toma.id, WEAR_GARMENT_TOOL_NAME, { garment: "Джинсы" });
+    assert(!notOwned.ok, "предмет не из гардероба отклонён");
+    assert(
+      notOwned.result.includes("нет в твоём гардеробе") &&
+        notOwned.result.includes("Домашний свитер") &&
+        notOwned.result.includes("Вечернее платье"),
+      `ошибка перечисляет свои предметы (получено: ${notOwned.result.slice(0, 120)})`
+    );
+
+    // Уже надетое — отказ
+    const same = engine.act(gwScene.id, toma.id, WEAR_GARMENT_TOOL_NAME, { garment: "Вечернее платье" });
+    assert(!same.ok && same.result.includes("уже надето"), "повторное надевание надетого отклонено");
+
+    // Обратно: эффекты платья снялись, свитер вернулся
+    const back = engine.act(gwScene.id, toma.id, WEAR_GARMENT_TOOL_NAME, { garment: "Домашний свитер" });
+    assert(back.ok, "переодевание обратно прошло");
+    const tBack = getCharacter(toma.id)!;
+    assert((tBack.state.worn_top as string) === "Домашний свитер", "свитер снова надет");
+    assert((tBack.state.mood as number) === 5, "эффекты обратимы: mood вернулся к 5");
+    assert((tBack.state.charisma as number) === 0, "харизма платья снялась");
+
+    // Витрина не видна другим, переодевание — видно
+    const zlVisible = getVisibleEvents(gwScene.id, zlata.id, 100);
+    assert(
+      !zlVisible.some((e) => (e.payload.calls ?? []).some((c) => c.toolName === WARDROBE_BROWSE_TOOL_NAME)),
+      "чужая витрина гардероба не видна"
+    );
+    assert(
+      zlVisible.some(
+        (e) => e.type === "action" && (e.payload.calls ?? []).some((c) => c.toolName === WEAR_GARMENT_TOOL_NAME && c.ok)
+      ),
+      "переодевание наблюдается другими участниками"
+    );
+    checkProtocol(gwScene.id, toma.id, "Тома-гардероб");
+  }
+
+  // =====================================================================
+  // Блок 18: границы-условия — правило из нескольких BoundaryCondition
+  // =====================================================================
+  {
+    const { setRelation, getRelation } = await import("../src/db/queries");
+
+    const cuddle = createTool({
+      name: "cuddle_cond",
+      title: "Обнять",
+      description: "Обнять и прижать",
+      parametersSchema: { type: "object", properties: { to: { type: "string" } }, required: ["to"] },
+      audience: "target",
+      targetParam: "to",
+      observationTemplate: "{name} обнимает {to}",
+      effects: [{ target: "tool_target", key: "mood", op: "add", value: 1 }],
+      cost: 5,
+    });
+    const oskar = quietHuman("Оскар", [cuddle.id], { money: 40, mood: 6 });
+    const patri = quietHuman("Патриция");
+    // Правило из трёх условий («И»): отношение ≥ 3, настроение ≥ 5, место «дом».
+    updChar2(patri.id, {
+      state: { mood: 5, worn_top: "Плед" },
+      boundaries: [
+        {
+          toolName: "cuddle_cond",
+          conditions: [
+            { kind: "relation", op: ">=", value: 3 },
+            { kind: "attr", owner: "target", key: "mood", op: ">=", value: 5 },
+            { kind: "place", place: "дом" },
+          ],
+          refusalText: "мягко отстраняется",
+          effects: [],
+        },
+      ],
+    });
+    const condRule = getCharacter(patri.id)!.boundaries[0]!;
+    assert(
+      (condRule.conditions ?? []).length === 3,
+      `правило с conditions читается как есть (${JSON.stringify(condRule.conditions)})`
+    );
+    setRelation(patri.id, oskar.id, 1);
+    const condScene = createScene({
+      name: "Границы-условия",
+      setting: "",
+      config: { place: "улица" },
+      characterIds: [oskar.id, patri.id],
+    });
+    const cuddleOskar = () => engine.act(condScene.id, oskar.id, "cuddle_cond", { to: "Патриция" });
+
+    // 1. Отношение 1 < 3 (и место не то): отказ называет ПЕРВОЕ несработавшее условие
+    const r1 = cuddleOskar();
+    assert(!r1.ok, "условия не выполнены — отказ");
+    assert(
+      r1.result.includes("отношение") && r1.result.includes("ещё не доросло") && r1.result.includes("Патриция"),
+      `причина называет отношение владельца (получено: ${r1.result.slice(0, 120)})`
+    );
+    assert((getCharacter(oskar.id)!.state.money as number) === 40, "при отказе деньги целы (fail-closed)");
+
+    // 2. Отношение ок, место всё ещё «улица»: отказ называет место
+    setRelation(patri.id, oskar.id, 4);
+    const r2 = cuddleOskar();
+    assert(!r2.ok, "не то место — отказ даже при отношении 4");
+    assert(
+      r2.result.includes("не то место") && r2.result.includes("улица"),
+      `причина называет место сцены (получено: ${r2.result.slice(0, 120)})`
+    );
+
+    // 3. Место «дом», но настроение 2 < 5: отказ называет характеристику
+    const { updateScene: updSceneCond } = await import("../src/db/queries");
+    updSceneCond(condScene.id, { config: { place: "дом" } });
+    updChar2(patri.id, { state: { mood: 2, worn_top: "Плед" } });
+    const r3 = cuddleOskar();
+    assert(!r3.ok, "настроение ниже порога — отказ");
+    assert(
+      r3.result.includes("Настроение") && r3.result.includes("ниже нужного"),
+      `причина называет лейбл характеристики из реестра (получено: ${r3.result.slice(0, 120)})`
+    );
+    assert(getRelation(patri.id, oskar.id) === 4, "пустые effects правила — отношение не тронуто");
+
+    // 4. Все условия выполнены — обнимание проходит, платный тул списывает деньги
+    updChar2(patri.id, { state: { mood: 5, worn_top: "Плед" } });
+    const r4 = cuddleOskar();
+    assert(r4.ok, "все три условия выполнены — действие прошло");
+    assert((getCharacter(oskar.id)!.state.money as number) === 35, "успех списал $5 (40 → 35)");
+    assert((getCharacter(patri.id)!.state.mood as number) === 6, "эффект тула применился (mood 5 → 6)");
+
+    // 5. Добавляем четвёртое условие (слот top занят) и снимаем одежду — отказ
+    updChar2(patri.id, {
+      boundaries: [
+        {
+          toolName: "cuddle_cond",
+          conditions: [
+            { kind: "relation", op: ">=", value: 3 },
+            { kind: "attr", owner: "target", key: "mood", op: ">=", value: 5 },
+            { kind: "place", place: "дом" },
+            { kind: "worn", slot: "top", bare: false },
+          ],
+          refusalText: "мягко отстраняется",
+          effects: [],
+        },
+      ],
+    });
+    updChar2(patri.id, { state: { mood: 5, worn_top: "" } });
+    const r5 = cuddleOskar();
+    assert(!r5.ok, "пустой слот top — отказ по условию worn");
+    assert(
+      r5.result.includes("слот top") && r5.result.includes("занят"),
+      `причина называет условие об одежде (получено: ${r5.result.slice(0, 120)})`
+    );
+    assert((getCharacter(oskar.id)!.state.money as number) === 35, "повторный отказ — деньги не тронуты");
   }
 
   console.log("\nE2E: все проверки пройдены ✅");

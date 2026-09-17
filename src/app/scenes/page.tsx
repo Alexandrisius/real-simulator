@@ -20,13 +20,11 @@ import { Dropdown } from "@/components/Dropdown";
 import { api, apiDelete, apiPost } from "@/components/api";
 import type { Character, Place, Scene, SceneConfig, ValidationSchema } from "@/lib/types";
 
-/** Запасные пресеты мест, если реестр мест пуст (основной источник — /api/places). */
-const PLACE_PRESETS = ["дом", "улица", "кафе", "отель", "пляж"];
-
-const placeOptionsOf = (places: Place[]) =>
-  places.length > 0
-    ? places.map((p) => ({ value: p.name, label: p.name }))
-    : PLACE_PRESETS.map((p) => ({ value: p, label: p }));
+/** Варианты места действия: только реестр мест (/api/places) плюс «не задано». */
+const placeOptionsOf = (places: Place[]) => [
+  { value: "", label: "— не задано —" },
+  ...places.map((p) => ({ value: p.name, label: p.name })),
+];
 
 export default function ScenesPage() {
   const [scenes, setScenes] = useState<Scene[]>([]);
@@ -158,22 +156,21 @@ export default function ScenesPage() {
             <Field label="Название">
               <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="Вечер пятницы" />
             </Field>
-            <Field label="Место действия" hint="окружение: влияет на границы и одежду; реестр — в разделе «Характеристики»">
-              <div className="flex gap-2">
-                <Input
-                  value={place}
-                  onChange={(e) => setPlace(e.target.value)}
-                  placeholder="дом, улица, кафе…"
-                />
-                <div className="w-36 shrink-0">
-                  <Dropdown
-                    value={placeOptions.some((o) => o.value === place) ? place : ""}
-                    options={placeOptions}
-                    onChange={(v) => setPlace(v)}
-                    title="Места из реестра"
-                  />
-                </div>
-              </div>
+            <Field
+              label="Место действия"
+              hint={
+                places.length === 0
+                  ? "Сначала создайте места в разделе „Характеристики“ → „Места“"
+                  : "окружение: влияет на границы и одежду; реестр — в разделе «Характеристики»"
+              }
+            >
+              <Dropdown
+                value={place}
+                options={placeOptions}
+                onChange={setPlace}
+                disabled={places.length === 0}
+                title="Места из реестра"
+              />
             </Field>
             <Field label="Обстановка сцены" hint="Контекст для всех персонажей: время, обстоятельства" className="sm:col-span-2">
               <Input

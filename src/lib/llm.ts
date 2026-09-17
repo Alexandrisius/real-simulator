@@ -32,6 +32,8 @@ export interface CompletionResult {
     }[];
   };
   usage?: { prompt_tokens?: number; completion_tokens?: number };
+  /** finish_reason провайдера: content_filter — цензура, length — обрыв по токенам */
+  finishReason?: string | null;
   raw: unknown;
 }
 
@@ -163,7 +165,7 @@ export async function chatCompletion(opts: ChatOptions): Promise<CompletionResul
   }
   let data: {
     error?: unknown;
-    choices?: { message?: CompletionResult["message"] }[];
+    choices?: { message?: CompletionResult["message"]; finish_reason?: string | null }[];
     usage?: CompletionResult["usage"];
   };
   try {
@@ -180,7 +182,12 @@ export async function chatCompletion(opts: ChatOptions): Promise<CompletionResul
   }
   const message = data.choices?.[0]?.message;
   if (!message) throw new Error("Пустой ответ модели (нет choices[0].message)");
-  return { message, usage: data.usage, raw: data };
+  return {
+    message,
+    usage: data.usage,
+    finishReason: data.choices?.[0]?.finish_reason ?? null,
+    raw: data,
+  };
 }
 
 // ---------- Mock-провайдер ----------
@@ -194,7 +201,15 @@ function mockCompletion(opts: ChatOptions): CompletionResult {
   const shopItems = opts.mockContext?.shopItems ?? [];
   const msgs = opts.messages;
 
-  const lastIsToolResult = msgs.length > 0 && msgs[msgs.length - 1].role === "tool";
+  // Движок после tool-результатов вставляет user-ремарку анти-галлюцинации
+  // («другие не отвечали…») — для мока это продолжение того же tool-обмена.
+  const lastMsg = msgs[msgs.length - 1];
+  const lastIsToolResult =
+    lastMsg?.role === "tool" ||
+    (lastMsg?.role === "user" &&
+      typeof lastMsg.content === "string" &&
+      lastMsg.content.startsWith("(") &&
+      msgs[msgs.length - 2]?.role === "tool");
   const actCount = msgs.filter((m) => m.role === "assistant" && m.tool_calls?.length).length;
   // Номер хода из финальной подсказки "(Ход N. …)" и что уже делали в диалоге
   const lastContent = typeof msgs[msgs.length - 1]?.content === "string" ? (msgs[msgs.length - 1].content as string) : "";
@@ -212,8 +227,15 @@ function mockCompletion(opts: ChatOptions): CompletionResult {
     };
   }
   // Сценарная очередь (тестовый хук): следующий пункт играет первым.
+  // name="" — шаг-«отказ»: только content, без tool-вызова (имитация цензуры).
   if (g.__simMockScript && g.__simMockScript.length > 0) {
     const step = g.__simMockScript.shift()!;
+    if (!step.name) {
+      return {
+        message: { role: "assistant", content: step.content ?? "" },
+        raw: { mock: true },
+      };
+    }
     return {
       message: {
         role: "assistant",

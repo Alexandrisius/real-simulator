@@ -26,6 +26,8 @@ function runSeeds(db: DB): void {
   seedAttributes(db);
   seedClothingSlots(db);
   seedPlaces(db);
+  seedGarments(db);
+  ensureMoneyAttribute(db);
   const done = db.prepare("SELECT value FROM app_meta WHERE key = 'seeded_tools'").get() as
     | { value: string }
     | undefined;
@@ -212,6 +214,24 @@ function seedProducts(db: DB): void {
 }
 
 /**
+ * money — системная характеристика (ключ state.money: магазин, платные тулы,
+ * доход), поэтому строка реестра обязана существовать всегда: без неё деньги
+ * выпадают из клампинга и торчат в редакторе «вне реестра». Добавляется и в
+ * базы, где реестр полностью пересобирали (демо-миры), один раз под флагом.
+ */
+function ensureMoneyAttribute(db: DB): void {
+  const done = db.prepare("SELECT value FROM app_meta WHERE key = 'seeded_money_attr'").get() as
+    | { value: string }
+    | undefined;
+  if (done) return;
+  db.prepare("INSERT OR IGNORE INTO app_meta (key, value) VALUES ('seeded_money_attr', '1')").run();
+  db.prepare(
+    `INSERT OR IGNORE INTO attributes (key, label, emoji, type, unit, min, max, options, position, visibility, lie_penalty, covered_by, created_at)
+     VALUES ('money', 'Деньги', '💵', 'number', '$', 0, NULL, '[]', 90, 'public', 2, '[]', ?)`
+  ).run(new Date().toISOString());
+}
+
+/**
  * Реестр характеристик персонажей: рост, вес, физподготовка, красота…
  * Значения живут в state персонажа по ключу атрибута; определения — чисто
  * метаданные для форм редактора и подсказок эффектов.
@@ -296,4 +316,95 @@ function seedPlaces(db: DB): void {
   add("улица", "Городская улица: прохожие, воздух и людские глаза.", 4);
   add("пляж", "Пляж: море, песок, минимум одежды и максимум солнца.", 5);
   add("сауна", "Элитная сауна: пар, вино, массажный стол и расслабленность.", 6);
+}
+
+/**
+ * Демо-гардероб для магазина одежды. Сеется только при наличии базовых слотов
+ * (top/bottom/underwear); эффекты ссылаются исключительно на уже сеяные ключи
+ * атрибутов (mood/energy/looks — money эффектом одежды быть не может).
+ * Владение одеждой персонажами не сеется — гардероб каждого собирает пользователь.
+ */
+function seedGarments(db: DB): void {
+  const done = db.prepare("SELECT value FROM app_meta WHERE key = 'seeded_garments'").get() as
+    | { value: string }
+    | undefined;
+  if (done) return;
+  // Слоты сеются раньше (seedClothingSlots выше по runSeeds); если их нет —
+  // ждём следующего запуска: флаг не ставим, чтобы засеять, когда мир дорастёт.
+  const slots = (
+    db.prepare("SELECT slot FROM clothing_slots").all() as unknown as { slot: string }[]
+  ).map((r) => r.slot);
+  if (!slots.includes("top") || !slots.includes("bottom") || !slots.includes("underwear")) return;
+  db.prepare("INSERT OR REPLACE INTO app_meta (key, value) VALUES ('seeded_garments', '1')").run();
+
+  const insert = db.prepare(
+    `INSERT OR IGNORE INTO garments (name, emoji, description, slot, effects, price, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`
+  );
+  const now = new Date().toISOString();
+  const add = (
+    name: string,
+    emoji: string,
+    description: string,
+    slot: string,
+    effects: unknown[],
+    price: number
+  ) => insert.run(name, emoji, description, slot, JSON.stringify(effects), price, now);
+
+  add(
+    "Строгий пиджак",
+    "👔",
+    "Деловой костюмный пиджак: осанка прямее, взгляд увереннее.",
+    "top",
+    [{ target: "self", key: "looks", op: "add", value: 1 }],
+    60
+  );
+  add(
+    "Классическая рубашка",
+    "👕",
+    "Аккуратная рубашка на все случаи: уместна и в кафе, и в офисе.",
+    "top",
+    [],
+    35
+  );
+  add(
+    "Спортивный костюм",
+    "🏃",
+    "Тренировочный костюм: тело сразу настраивается на движение.",
+    "top",
+    [{ target: "self", key: "energy", op: "add", value: 1 }],
+    45
+  );
+  add(
+    "Вечернее платье",
+    "👗",
+    "Платье для особого вечера: в нём трудно остаться незамеченным.",
+    "top",
+    [{ target: "self", key: "looks", op: "add", value: 1 }],
+    80
+  );
+  add(
+    "Джинсы",
+    "👖",
+    "Прочные удобные джинсы на каждый день.",
+    "bottom",
+    [],
+    40
+  );
+  add(
+    "Шорты",
+    "🩳",
+    "Лёгкие шорты: для жары, пляжа и домашнего уюта.",
+    "bottom",
+    [],
+    20
+  );
+  add(
+    "Кружевное бельё",
+    "🌸",
+    "Изящное бельё: носится для себя — и немного для настроения.",
+    "underwear",
+    [{ target: "self", key: "mood", op: "add", value: 1 }],
+    50
+  );
 }

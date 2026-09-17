@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowDown,
   ArrowUp,
@@ -44,6 +44,8 @@ export default function SchemasPage() {
   const [open, setOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  // Реф карточки формы: «Изменить» открывает форму наверху страницы — прокручиваем к ней
+  const formRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(() => {
     Promise.all([api<ValidationSchema[]>("/api/schemas"), api<Tool[]>("/api/tools")])
@@ -71,6 +73,9 @@ export default function SchemasPage() {
     });
     setEditingId(s.id);
     setOpen(true);
+    requestAnimationFrame(() =>
+      formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+    );
   };
 
   const save = async () => {
@@ -137,6 +142,7 @@ export default function SchemasPage() {
       <ErrorText>{error}</ErrorText>
 
       {open && (
+        <div ref={formRef}>
         <Card className="mb-6 p-5">
           <div className="mb-4 text-sm font-medium">
             {editingId ? `Редактирование: ${form.name}` : "Новая схема"}
@@ -304,6 +310,7 @@ export default function SchemasPage() {
             </Btn>
           </div>
         </Card>
+        </div>
       )}
 
       {schemas.length === 0 ? (

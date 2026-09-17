@@ -35,6 +35,9 @@ function flatCalls(events: SimEvent[], characterId: number): FlatCall[] {
   for (const e of events) {
     if (e.type !== "action" || e.actorId !== characterId) continue;
     for (const c of e.payload.calls ?? []) {
+      // Предложения (offered) — не исполненные действия: скоринг их не видит,
+      // засчитывается только состоявшееся действие (в т.ч. по согласию).
+      if (c.offered) continue;
       out.push({ toolName: c.toolName, args: c.args, turn: e.turn, ok: c.ok });
     }
   }

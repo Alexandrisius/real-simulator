@@ -18,6 +18,8 @@ export async function POST(req: Request) {
         throw new ApiError(400, "Для ИИ-персонажа нужен провайдер (моделей)");
       if (!getProvider(data.providerId))
         throw new ApiError(400, "Провайдер не найден — сначала создайте его");
+      if (data.fallbackProviderId != null && !getProvider(data.fallbackProviderId))
+        throw new ApiError(400, "Страховочный провайдер не найден");
     }
     return NextResponse.json(
       createCharacter({
@@ -32,6 +34,8 @@ export async function POST(req: Request) {
         state: data.state,
         isHuman: data.isHuman,
         boundaries: data.boundaries,
+        fallbackProviderId: data.isHuman ? null : (data.fallbackProviderId ?? null),
+        fallbackModel: data.isHuman ? "" : (data.fallbackModel ?? ""),
       }),
       { status: 201 }
     );

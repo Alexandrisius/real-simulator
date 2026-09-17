@@ -60,6 +60,15 @@ export interface Tool {
   trainsSkill: string;
   /** Исходы: условие → эффекты + заметка цели (первый подошедший поверх базовых эффектов) */
   outcomes: ToolOutcome[];
+  /**
+   * Адресный инструмент требует согласия получателя: вызов сначала создаёт
+   * предложение (offer), а действие исполняется только после «да» адресата.
+   * Опционально в типе: локальные виртуальные тулы (undress, shop_buy…)
+   * поле не задают; тулы из БД всегда имеют значение (queries:mapTool).
+   */
+  requiresConsent?: boolean;
+  /** Эффекты при отказе получателя (предложение отклонено): мягкая социальная цена */
+  declineEffects?: ToolEffect[];
   /** Кто создал инструмент: вручную или агент через заявку (с одобрением архитектора) */
   origin: "manual" | "agent";
   /** Персонаж, по чьей заявке создан (при origin=agent) */
@@ -115,6 +124,51 @@ export const WEAR_TOOL_NAME = "wear";
 export const GO_TOOL_NAME = "go_to";
 /** Виртуальный инструмент «пригласить персонажа в место» (доставляет приглашение). */
 export const INVITE_TOOL_NAME = "invite";
+/** Виртуальный инструмент «ответить на предложение» (принять/отклонить оффер). */
+export const RESPOND_TOOL_NAME = "respond_to_offer";
+/** Виртуальный инструмент «покинуть сцену» (персонаж выходит из ротации). */
+export const LEAVE_SCENE_TOOL_NAME = "leave_scene";
+/** Виртуальный инструмент «заблокировать персонажа» (обоюдное молчание в сцене). */
+export const BLOCK_TOOL_NAME = "block_character";
+/** Виртуальный инструмент «сказать фразу вслух» (общение — только тулами). */
+export const SAY_TOOL_NAME = "say";
+/** Виртуальный инструмент «написать сообщение в переписке» (телефон/чат). */
+export const TEXT_TOOL_NAME = "text_message";
+/** Виртуальный инструмент «посмотреть свой гардероб». */
+export const WARDROBE_BROWSE_TOOL_NAME = "wardrobe_browse";
+/** Виртуальный инструмент «надеть предмет из своего гардероба». */
+export const WEAR_GARMENT_TOOL_NAME = "wear_garment";
+
+// ---- Предложения действий (offers): агент предлагает другому вызов тула ----
+
+export type OfferStatus = "pending" | "accepted" | "declined" | "expired";
+
+/** Предложение действия: from предлагает to вызвать toolName с аргументами. */
+export interface Offer {
+  id: number;
+  sceneId: number;
+  fromId: number;
+  toId: number;
+  toolName: string;
+  args: Record<string, unknown>;
+  status: OfferStatus;
+  /** Комментарий адресата при решении (почему отказал) */
+  comment: string | null;
+  /** Ход, на котором предложение создано */
+  turn: number;
+  /** Ход, после которого предложение протухает */
+  expiresTurn: number;
+  createdAt: string;
+  decidedAt: string | null;
+}
+
+/** Блокировка в сцене: blocker заглушил blocked (молчание в обе стороны). */
+export interface SceneBlock {
+  sceneId: number;
+  blockerId: number;
+  blockedId: number;
+  createdAt: string;
+}
 
 /** Префиксы state-ключей одежды: worn_top = «надето», carried_top = «снято, в руках». */
 export const WORN_PREFIX = "worn_";
@@ -158,6 +212,68 @@ export interface PendingEffect {
   appliedAt: string | null;
 }
 
+// ---- Гардероб: предметы одежды как отдельные карточки ----
+
+/**
+ * Предмет одежды: карточка со слотом и эффектами «пока надето». Покупается в
+ * магазине (или раздаётся через REST), хранится в гардеробе персонажа
+ * (character_garments); ношение — плоские ключи state worn_<slot>.
+ */
+export interface Garment {
+  id: number;
+  /** Уникальное человекочитаемое название («Джинсы») — по нему ищут агенты */
+  name: string;
+  emoji: string;
+  description: string;
+  /** Слот из реестра clothing_slots ('' = предмет без слота, просто хранится) */
+  slot: string;
+  /** Эффекты «пока надето»: только self-эффекты на носителя (обратимые add) */
+  effects: ToolEffect[];
+  /** Цена в магазине (0 = не продаётся, раздаётся через гардероб) */
+  price: number;
+  createdAt: string;
+}
+
+// ---- Комбо: цепочка вызовов с наградой ----
+
+/**
+ * Шаг комбо: инструмент + необязательные фильтры ролей. actorName/targetName —
+ * имена участников («кто делает» / «на ком делают»); без фильтров шагу всё
+ * равно, кто вызвал и на кого. Если ни у одного шага нет фильтров — работает
+ * легаси-правило: всю цепочку должен пройти один и тот же персонаж.
+ */
+export interface ComboStep {
+  toolName: string;
+  actorName?: string | null;
+  targetName?: string | null;
+}
+
+/**
+ * Комбо: последовательность успешных (исполненных, не предложений) вызовов
+ * за окно ходов. Кто «знает» комбо (knowers) — видит подсказку-рецепт;
+ * пусто = рецепт не знает никто (секретное «достижение»: узнают по анонсу).
+ * announce — при срабатывании объявить всем участникам событием мира.
+ */
+export interface Combo {
+  id: number;
+  /** Уникальный машинный ключ ([a-z0-9_]) */
+  name: string;
+  /** Человекочитаемый заголовок («Нежное утро») */
+  title: string;
+  description: string;
+  /** Цепочка шагов в точном порядке */
+  steps: ComboStep[];
+  /** Сколько ходов отделяет первый шаг от последнего */
+  windowTurns: number;
+  /** Эффекты завершённого комбо (актёр — исполнитель последнего шага, tool_target — его цель) */
+  effects: ToolEffect[];
+  /** id персонажей, знающих рецепт комбо (пусто = никто: секретное достижение) */
+  knowers: number[];
+  /** Объявить срабатывание всем участникам сцены («достижение открыто») */
+  announce: boolean;
+  createdAt: string;
+}
+
 /**
  * Определение характеристики персонажа (реестр). Значения хранятся в
  * state персонажа по ключу — реестр это метаданные для форм и подсказок.
@@ -195,8 +311,8 @@ export interface ToolSpec {
 
 /**
  * Отношение — направленное чувство между персонажами (матрица в таблице
- * relations): «насколько X расположен к Y». Проверяется границами (minRelation
- * цели к актёру) и условиями переходов флоу.
+ * relations): «насколько X расположен к Y». Проверяется границами (условие
+ * kind:"relation" — цели к актёру) и условиями переходов флоу.
  */
 
 /**
@@ -219,12 +335,14 @@ export interface KnowledgeEntry {
 /**
  * Слот одежды в реестре. layer задаёт порядок: нельзя снять слой 2 (бельё),
  * пока надет слой 1 (верхнее). undressPlaces — в каких местах сцены слот
- * можно снять (пусто = где угодно).
+ * можно снять (пусто = где угодно). bareEffects — эффекты ПУСТОГО слота
+ * (нет белья → беспокойство; надевание их гасит, снятие возвращает).
  */
 export interface ClothingSlot {
   slot: string;
   layer: number;
   undressPlaces: string[];
+  bareEffects: ToolEffect[];
   position: number;
   createdAt: string;
 }
@@ -330,6 +448,14 @@ export interface Character {
   /** null у персонажей-людей (управляются пользователем вручную) */
   providerId: number | null;
   model: string;
+  /**
+   * Страховочный провайдер (null = нет): когда основная модель отказывается
+   * (цензура) или её ответ обрывается, ход молча перенаправляется сюда —
+   * отказ не попадает в события сцены. Следующий ход снова делает основная.
+   */
+  fallbackProviderId: number | null;
+  /** Модель страховочного провайдера (id модели, напр. grok-4.2) */
+  fallbackModel: string;
   temperature: number;
   maxTokens: number;
   /** Отсортированный список id доступных инструментов */
@@ -349,7 +475,17 @@ export interface Character {
   createdAt: string;
 }
 
-/** Условие на истинный атрибут владельца (проверяется физикой, не заявлениями). */
+/** Условие границы. Все условия правила объединяются по «И». */
+export type BoundaryCondition =
+  | { kind: "relation"; op: ">=" | "<" | "="; value: number } // отношение ВЛАДЕЛЬЦА границы к актёру (системная матрица отношений)
+  | { kind: "attr"; owner: "actor" | "target"; key: string; op: ">=" | "<" | "="; value: number } // характеристика актёра или владельца (ключ из реестра), проверяется по истинному state
+  | { kind: "place"; place: string } // место сцены (scene.config.place, без учёта регистра)
+  | { kind: "worn"; slot: string; bare: boolean }; // слот одежды ВЛАДЕЛЬЦА: bare=true — слот пуст, false — занят
+
+/**
+ * @deprecated Легаси-форма требования requireAttr: теперь это условие
+ * kind:"attr" внутри conditions (переписывается при чтении — queries.ts:mapBoundary).
+ */
 export interface BoundaryRequireAttr {
   /** Чей атрибут проверяем: актёра или самого владельца границы */
   owner: "actor" | "target";
@@ -365,18 +501,72 @@ export interface BoundaryRequireAttr {
  * отказ: действие не исполняется, деньги не списываются, применяются
  * effects нарушения (target 'relation' — отношение владельца к актёру,
  * 'self' — state самого владельца; эффектов на актёра нет).
+ * Легаси-поля (minRelation/minAttr/minMood/requirePlace/requireAttr) держатся
+ * только для старых записей и литералов: при чтении (queries.ts:mapBoundary)
+ * они переписываются в conditions и в нормализованном правиле не хранятся.
  */
 export interface Boundary {
   toolName: string;
-  minRelation: number | null;
-  /** Порог mood (или другого ключа настроения) владельца границы */
-  minMood: number | null;
-  /** Требуемое место сцены (scene.config.place) */
-  requirePlace: string | null;
-  requireAttr: BoundaryRequireAttr | null;
+  /**
+   * Когда правило действует: "incoming" (по умолчанию) — когда кто-то
+   * применяет тул ко мне; "outgoing" — когда я сам применяю тул к другому
+   * («я не сплю с теми, у кого X < N»); "both" — в обе стороны.
+   * Роли в условиях всегда относительно вызова: actor — кто вызывает,
+   * target — на кого.
+   */
+  scope?: "incoming" | "outgoing" | "both";
+  /**
+   * Условия допуска («И»); пустой список — правило никогда не срабатывает.
+   * Верно управляемый код всегда заполняет его (queries.ts:mapBoundary при
+   * чтении, api.ts:boundarySchema на входе); поле оставлено необязательным
+   * только чтобы старые литералы с легаси-полями продолжали компилироваться.
+   */
+  conditions?: BoundaryCondition[];
   /** Текст отказа от лица владельца («твёрдо отстраняется: слишком рано») */
   refusalText: string;
   effects: ToolEffect[];
+  /** @deprecated Легаси: порог отношения владельца к актёру → условие kind:"relation" */
+  minRelation?: number | null;
+  /** @deprecated Легаси: порог характеристики владельца (state[key] >= value) → условие kind:"attr" */
+  minAttr?: { key: string; value: number } | null;
+  /** @deprecated Легаси-порог mood; читается только при отсутствии minAttr → kind:"attr" по ключу mood */
+  minMood?: number | null;
+  /** @deprecated Легаси: требуемое место сцены (scene.config.place) → условие kind:"place" */
+  requirePlace?: string | null;
+  /** @deprecated Легаси: требование к истинному атрибуту → условие kind:"attr" */
+  requireAttr?: BoundaryRequireAttr | null;
+}
+
+/** Условие авто-финиша сцены (движок сверяет после каждого хода). */
+export type FinishCondition =
+  | {
+      /** Персонаж (или кто угодно) успешно вызвал инструмент */
+      type: "toolCall";
+      toolName: string;
+      characterId?: number;
+    }
+  | {
+      /** Сработал исход инструмента («кульминация случилась») */
+      type: "outcome";
+      toolName: string;
+      outcomeId: string;
+      /** Необязательное закрепление за персонажем (как у toolCall) */
+      characterId?: number;
+    }
+  | {
+      /** Числовая проверка state персонажа (или любого участника) */
+      type: "state";
+      characterId?: number;
+      key: string;
+      op: ">=" | "<" | "=";
+      value: number;
+    };
+
+/** Настройка авто-финиша: все условия («И») + пауза в ходах после срабатывания. */
+export interface SceneFinishConfig {
+  conditions: FinishCondition[];
+  /** Сколько ходов досидеть после срабатывания условий (0 = сразу) */
+  delayTurns: number;
 }
 
 export interface SceneConfig {
@@ -398,6 +588,10 @@ export interface SceneConfig {
   maxTokensPerScene: number;
   /** Разрешить агентам просить новые инструменты через request_tool */
   allowToolRequests: boolean;
+  /** Разрешить агентам отвечать на предложения и покидать сцену (respond_to_offer / leave_scene) */
+  allowAgentStops: boolean;
+  /** Авто-финиш: условия срабатывания и задержка (null = выключено) */
+  finish: SceneFinishConfig | null;
   /** Место действия («дом», «улица», «кафе»…): окружение + правило для границ/одежды */
   place: string;
 }
@@ -412,6 +606,8 @@ export const DEFAULT_SCENE_CONFIG: SceneConfig = {
   maxApiCallsPerScene: 300,
   maxTokensPerScene: 1_000_000,
   allowToolRequests: false,
+  allowAgentStops: true,
+  finish: null,
   place: "",
 };
 
@@ -450,6 +646,14 @@ export interface ActionCall {
   audience: Audience;
   /** id сработавшего исхода (если у тула есть исходы и один сработал) */
   outcome?: string;
+  /** id разрешённого получателя адресного тула (для комбо-фильтров по цели) */
+  targetId?: number;
+  /**
+   * true = это вызов-предложение (требует согласия получателя): действие
+   * ещё не совершено, только предложено. Скоринг и условия флоу считают
+   * только исполненные вызовы (offered не считаются).
+   */
+  offered?: boolean;
 }
 
 export interface EventPayload {
@@ -464,6 +668,10 @@ export interface EventPayload {
   stateChanges?: { characterId: number; key: string; value: unknown }[];
   /** Изменения отношений, применённые этим ходом (fromId чувствует к toId) */
   relationChanges?: { fromId: number; toId: number; value: number }[];
+  /** action: сработавшее комбо (движок досылает эффекты и личную заметку) */
+  comboId?: number;
+  /** action: id предложения, связанного с этим вызовом (respond_to_offer и т.п.) */
+  offerId?: number;
   [k: string]: unknown;
 }
 

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Plus, ShoppingCart, Trash2 } from "lucide-react";
 import {
   Badge,
@@ -15,6 +15,7 @@ import {
   Select,
   Textarea,
 } from "@/components/ui";
+import { Combobox } from "@/components/Combobox";
 import { api, apiDelete, apiPatch, apiPost } from "@/components/api";
 import type { AttributeDef, ClothingSlot, ShopProduct, ToolEffect } from "@/lib/types";
 
@@ -62,6 +63,8 @@ export default function ShopPage() {
   const [open, setOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  // Реф карточки формы: «Изменить» открывает форму наверху страницы — прокручиваем к ней
+  const formRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(() => {
     api<ShopProduct[]>("/api/products").then(setProducts).catch((e) => setError(e.message));
@@ -88,6 +91,9 @@ export default function ShopPage() {
     setForm(productToForm(p));
     setEditingId(p.id);
     setOpen(true);
+    requestAnimationFrame(() =>
+      formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+    );
   };
 
   const save = async () => {
@@ -137,6 +143,15 @@ export default function ShopPage() {
     return [...map.entries()];
   }, [products]);
 
+  // Подсказки категории: уже существующие на витрине (свободный ввод сохранён)
+  const categoryOptions = useMemo(
+    () =>
+      [...new Set(products.map((p) => p.category).filter(Boolean))].sort((a, b) =>
+        a.localeCompare(b, "ru")
+      ),
+    [products]
+  );
+
   return (
     <div className="mx-auto max-w-5xl px-8 py-10">
       <PageHeader
@@ -151,6 +166,7 @@ export default function ShopPage() {
       <ErrorText>{error}</ErrorText>
 
       {open && (
+        <div ref={formRef}>
         <Card className="mb-6 p-5">
           <div className="mb-4 text-sm font-medium">
             {editingId ? `Редактирование: ${form.name}` : "Новый товар"}
@@ -178,10 +194,14 @@ export default function ShopPage() {
                 className="w-20 text-center text-lg"
               />
             </Field>
-            <Field label="Категория" hint="группа на витрине: подарки, спорт, внешность…">
-              <Input
+            <Field
+              label="Категория"
+              hint="группа на витрине: подарки, спорт, внешность… Существующие подсказаны"
+            >
+              <Combobox
                 value={form.category}
-                onChange={(e) => setForm({ ...form, category: e.target.value })}
+                onChange={(v) => setForm({ ...form, category: v })}
+                options={categoryOptions}
                 placeholder="подарки"
               />
             </Field>
@@ -313,6 +333,7 @@ export default function ShopPage() {
             </Btn>
           </div>
         </Card>
+        </div>
       )}
 
       {products.length === 0 ? (

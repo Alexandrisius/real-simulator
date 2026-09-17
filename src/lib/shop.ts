@@ -2,18 +2,25 @@
 // Агентам дают два виртуальных тула: shop_browse (посмотреть ассортимент)
 // и shop_buy (купить / подарить). Покупка списывает деньги с state.money
 // и применяет эффекты товара — та же механика, что у инструментов.
+// Одежда (гардероб) продаётся здесь же: покупка кладёт предмет в гардероб
+// владельца и сразу надевает — эффекты ношения считаются как у undress/wear.
 
-import type { Audience, Character, ShopProduct, ToolEffect, ToolSpec } from "./types";
+import type { Audience, Character, Garment, ShopProduct, ToolEffect, ToolSpec } from "./types";
 import { CARRIED_PREFIX, MONEY_KEY, SHOP_BROWSE_TOOL, SHOP_BUY_TOOL, WORN_PREFIX } from "./types";
 import { getDb } from "@/db";
 import {
+  addGarmentToCharacter,
   addRelation,
   createPendingEffect,
   decrementPendingEffect,
+  findGarmentByName,
+  findOwnedGarmentByName,
   findProductByName,
+  getClothingSlot,
   getCharacter,
   getRelation,
   listAttributes,
+  listGarments,
   listPendingEffects,
   listProducts,
   markPendingApplied,
@@ -21,6 +28,7 @@ import {
   updateCharacter,
 } from "@/db/queries";
 import { applyRelationDelta, clampStateValues, resolveTargetByName } from "./tools";
+import { applyWearEffects, diffState, wornName } from "./wardrobe";
 
 export { SHOP_BROWSE_TOOL, SHOP_BUY_TOOL } from "./types";
 
@@ -53,7 +61,9 @@ function moneyOf(c: Character): number {
 /** Текст ассортимента для tool-ответа модели (shop_browse). */
 export function buildCatalogText(actor: Character): string {
   const products = listProducts();
-  if (products.length === 0) return "Магазин пуст — покупать нечего.";
+  // Продаётся только одежда с ценой: гардеробные предметы ($0) — раздача, не товар
+  const garments = listGarments().filter((g) => g.price > 0);
+  if (products.length === 0 && garments.length === 0) return "Магазин пуст — покупать нечего.";
   const lines: string[] = [`Ассортимент магазина (у тебя $${moneyOf(actor)}):`];
   let category = "";
   for (const p of products) {
@@ -70,7 +80,17 @@ export function buildCatalogText(actor: Character): string {
       }: наступит, только если дойдёшь до неё]` : ""}`
     );
   }
-  lines.push("Покупка — shop_buy с названием товара; для подарка укажи получателя в for.");
+  // Одежда: живёт в гардеробе владельца и надевается сразу при покупке
+  if (garments.length > 0) {
+    lines.push("— Одежда:");
+    for (const g of garments) {
+      lines.push(`  ${g.emoji} ${g.name} — $${g.price}. ${g.description} (слот: ${g.slot})`);
+    }
+  }
+  lines.push(
+    "Покупка — shop_buy с названием товара; для подарка укажи получателя в for. " +
+      "Одежда попадает в гардероб и надевается сразу."
+  );
   return lines.join("\n");
 }
 
@@ -129,6 +149,119 @@ function giftCountInScene(sceneId: number, buyerId: number, recipientName: strin
 /** Сколько подарков одному получателю за сцену выдерживает человек. */
 const GIFT_LIMIT_PER_SCENE = 3;
 
+/** Покупка одежды: деньги → гардероб → сразу надеть (эффекты ношения тем же ходом). */
+function buyGarment(
+  input: { actor: Character; participants: Character[]; args: Record<string, unknown> },
+  garment: Garment
+): ShopBuyResult {
+  const { actor, participants, args } = input;
+
+  const balance = moneyOf(actor);
+  if (balance < garment.price) {
+    return {
+      ok: false,
+      result: `Недостаточно денег: «${garment.name}» стоит $${garment.price}, а у тебя $${balance}. Заработай или выбери другое.`,
+      observation: "",
+      audience: "none",
+      stateChanges: [],
+      relationChanges: [],
+    };
+  }
+
+  // Получатель подарка (необязательный) — как у товаров
+  const forName = args["for"];
+  let recipient: Character | null = null;
+  if (typeof forName === "string" && forName.trim() !== "") {
+    recipient = resolveTargetByName(participants, forName);
+    if (!recipient) {
+      const names = participants.map((c) => c.name).join(", ");
+      return {
+        ok: false,
+        result: `Получатель «${forName}» не найден среди участников. Доступны: ${names}`,
+        observation: "",
+        audience: "none",
+        stateChanges: [],
+        relationChanges: [],
+      };
+    }
+  }
+
+  // Пресыщение подарками сознательно НЕ действует на одежду: это вещь,
+  // попадающая в гардероб, а не знак внимания — лимит товаров её не гасит.
+
+  const stateMap = new Map<number, Record<string, unknown>>();
+  const stateOf = (c: Character) => {
+    let s = stateMap.get(c.id);
+    if (!s) {
+      s = { ...(getCharacter(c.id)?.state ?? c.state) }; // свежий state: тулы одной итерации не затирают записи друг друга
+      stateMap.set(c.id, s);
+    }
+    return s;
+  };
+
+  const self = stateOf(actor);
+  self[MONEY_KEY] = moneyOf(actor) - garment.price;
+  const stateChanges: ShopBuyResult["stateChanges"] = [
+    { characterId: actor.id, key: MONEY_KEY, value: self[MONEY_KEY] },
+  ];
+
+  const wearer = recipient ?? actor;
+  const slotName = garment.slot.trim();
+  const slot = slotName !== "" ? getClothingSlot(slotName) : null;
+  if (slot) {
+    const wState = stateOf(wearer);
+    const before = { ...wState };
+    let cur: Character = { ...wearer, state: wState };
+    // Если в слоте уже что-то надето — сначала «снимаем» его: эффекты снятия
+    // (предмет −1, пустой слот +1), потом поверх — эффекты новой одежды (+1).
+    const prevName = wornName(wState, slotName);
+    if (prevName) {
+      const prev = findOwnedGarmentByName(wearer.id, prevName);
+      cur = applyWearEffects(cur, prev, slot, false);
+    }
+    cur = applyWearEffects({ ...wearer, state: cur.state }, garment, slot, true);
+    cur.state[WORN_PREFIX + slotName] = garment.name;
+    cur.state[CARRIED_PREFIX + slotName] = "";
+    stateMap.set(wearer.id, cur.state);
+    stateChanges.push(
+      ...diffState(wearer.id, before, cur.state).filter((c) => c.key !== MONEY_KEY)
+    );
+  }
+
+  addGarmentToCharacter(wearer.id, garment.id);
+
+  const defs = listAttributes();
+  stateMap.forEach((state, id) => updateCharacter(id, { state: clampStateValues(state, defs) }));
+
+  const worn = slot != null;
+  const observation = recipient
+    ? worn
+      ? `${actor.name} дарит ${recipient.name}: ${garment.emoji} ${garment.name} — и ${recipient.name} сразу это надевает`
+      : `${actor.name} дарит ${recipient.name}: ${garment.emoji} ${garment.name} (в гардероб)`
+    : worn
+      ? `${actor.name} покупает и надевает: ${garment.emoji} ${garment.name}`
+      : `${actor.name} покупает: ${garment.emoji} ${garment.name} (в гардероб)`;
+
+  let result = `Куплено: ${garment.name} за $${garment.price}. Остаток: $${self[MONEY_KEY]}.`;
+  result += worn
+    ? ` ${recipient ? recipient.name : "Ты"} надел(а) это (слот ${slotName}); одежда попала в гардероб.`
+    : " Одежда отправилась в гардероб" + (slotName !== "" ? ", но слот не зарегистрирован в этом мире — носить не на что." : " (предмет без слота).");
+  const wearChanges = stateChanges.filter((c) => c.key !== MONEY_KEY);
+  if (wearChanges.length > 0) {
+    result += ` | Изменения: ${wearChanges
+      .map((c) => `${c.key}=${JSON.stringify(c.value)}`)
+      .join(", ")}`;
+  }
+  return {
+    ok: true,
+    result,
+    observation,
+    audience: "all",
+    stateChanges,
+    relationChanges: [],
+  };
+}
+
 /** Покупка товара: проверка денег, списание, эффекты на себя/получателя. */
 export function executeShopBuy(input: {
   actor: Character;
@@ -141,9 +274,34 @@ export function executeShopBuy(input: {
 
   const product = findProductByName(args.item);
   if (!product) {
+    // Товара нет — пробуем гардероб: одежда продаётся в том же магазине
+    // (price > 0; гардеробные предметы без цены через магазин не выдаются).
+    const garment = findGarmentByName(args.item);
+    if (garment && garment.price > 0) {
+      return buyGarment(input, garment);
+    }
+    if (garment) {
+      return {
+        ok: false,
+        result: `«${garment.name}» не продаётся — это предмет гардероба без цены.`,
+        observation: "",
+        audience: "none",
+        stateChanges: [],
+        relationChanges: [],
+      };
+    }
+    // Список допустимых значений прямо в ошибке: агент выбирает, а не гадает.
+    const available = [
+      ...listProducts().map((p) => p.name),
+      ...listGarments()
+        .filter((g) => g.price > 0)
+        .map((g) => g.name),
+    ];
     return {
       ok: false,
-      result: `Товара «${String(args.item ?? "")}» в магазине нет. Вызови ${SHOP_BROWSE_TOOL} и посмотри, что есть.`,
+      result: `Товара «${String(args.item ?? "")}» в магазине нет. Выбери из: ${
+        available.join(", ") || "(витрина пуста)"
+      }. Полное описание — ${SHOP_BROWSE_TOOL}.`,
       observation: "",
       audience: "none",
       stateChanges: [],

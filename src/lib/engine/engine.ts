@@ -15,32 +15,43 @@ import type {
 import {
   appendApiLog,
   appendEvent,
+  blockedIdsFor,
+  expireOffersForScene,
   getCharacter,
   getProvider,
   getScene,
   getSceneGoals,
+  getSceneLeftIds,
   getSceneParticipants,
   getToolsByIds,
   getVisibleEvents,
   incrementSceneSpend,
+  isPairBlocked,
   knowledgeOf,
   listAttributes,
+  listCharacterGarments,
   listClothingSlots,
+  listCombos,
+  listGarments,
+  listPendingOffersForCharacter,
+  listPendingOffersForScene,
   listPlaces,
   listRelationsOf,
+  listSceneBlocks,
   listSkills,
+  listTools,
+  setOfferStatus,
   setSceneCursor,
   setSceneStatus,
 } from "@/db/queries";
 import { getDb } from "@/db";
-import { chatCompletion } from "@/lib/llm";
+import { chatWithFallback, type FallbackProviderConfig } from "@/lib/fallback";
 import { buildMessages } from "@/lib/prompt";
-import { executeTool, outcomeHintText, parseToolArguments } from "@/lib/tools";
+import { executeTool, outcomeHintText, parseToolArguments, resolveTargetByName } from "@/lib/tools";
 import { handleToolRequestCall, REQUEST_TOOL_SPEC } from "@/lib/toolRequests";
 import { buildCatalogText, executeShopBuy, SHOP_BROWSE_SPEC, SHOP_BUY_SPEC } from "@/lib/shop";
 import {
   executeReveal,
-  hasHiddenAttributes,
   REVEAL_TOOL_SPEC,
 } from "@/lib/knowledge";
 import {
@@ -49,18 +60,36 @@ import {
   UNDRESS_SPEC,
   WEAR_SPEC,
 } from "@/lib/clothing";
-import { executeGoTo, executeInvite, GO_SPEC, INVITE_SPEC } from "@/lib/places";
+import { executeGoTo, executeInvite, GO_SPEC, INVITE_SPEC, placeListText } from "@/lib/places";
 import { listProducts } from "@/db/queries";
 import {
+  BLOCK_TOOL_NAME,
   GO_TOOL_NAME,
   INVITE_TOOL_NAME,
+  LEAVE_SCENE_TOOL_NAME,
   REVEAL_TOOL_NAME,
   REQUEST_TOOL_NAME,
+  RESPOND_TOOL_NAME,
+  SAY_TOOL_NAME,
   SHOP_BROWSE_TOOL,
   SHOP_BUY_TOOL,
+  TEXT_TOOL_NAME,
   UNDRESS_TOOL_NAME,
+  WARDROBE_BROWSE_TOOL_NAME,
+  WEAR_GARMENT_TOOL_NAME,
   WEAR_TOOL_NAME,
 } from "@/lib/types";
+import { RESPOND_TOOL_SPEC, executeRespond } from "@/lib/offers";
+import { BLOCK_SPEC, LEAVE_SPEC, executeBlock, executeLeave } from "@/lib/stops";
+import { executeSay, executeTextMessage, SAY_SPEC, TEXT_SPEC } from "@/lib/chat";
+import {
+  wearOwnedGarment,
+  wardrobeTextFor,
+  WARDROBE_BROWSE_SPEC,
+  WEAR_GARMENT_SPEC,
+} from "@/lib/wardrobe";
+import { checkCombos } from "@/lib/combos";
+import { finishConditionsSatisfied } from "@/lib/finish";
 import { getHub, type StatusPayload } from "./hub";
 
 interface RunState {  sceneId: number;
@@ -74,6 +103,8 @@ interface RunState {  sceneId: number;
   wake: (() => void) | null;
   /** Счётчик подряд идущих неудачных ходов (для авто-паузы) */
   errors: number;
+  /** Ход, на котором впервые выполнились условия завершения сцены (null = ещё нет) */
+  finishMetAtTurn: number | null;
 }
 
 /** Таймаут одного вызова модели: локальные модели бывают медленными. */
@@ -153,6 +184,7 @@ export class Engine {
         abort: null,
         wake: null,
         errors: 0,
+        finishMetAtTurn: null,
       };
       this.runs.set(sceneId, run);
     }
@@ -162,10 +194,13 @@ export class Engine {
   private validate(sceneId: number): { charIds: number[] } {
     const scene = getScene(sceneId);
     if (!scene) throw new Error("Сцена не найдена");
+    const left = new Set(getSceneLeftIds(sceneId));
     const participants = getSceneParticipants(sceneId)
+      .filter((id) => !left.has(id))
       .map((id) => getCharacter(id))
       .filter((c): c is Character => c !== null);
-    if (participants.length === 0) throw new Error("В сцене нет персонажей");
+    if (participants.length === 0)
+      throw new Error("Все участники покинули сцену — начните новую или сбросьте сцену");
     const aiChars = participants.filter((c) => !c.isHuman);
     if (aiChars.length === 0)
       throw new Error("В сцене нет ИИ-персонажей — людям движок не нужен, общайтесь вручную");
@@ -182,6 +217,8 @@ export class Engine {
     const existing = this.runs.get(sceneId);
     if (existing?.status === "running") return this.emitStatus(sceneId);
     const { charIds } = this.validate(sceneId);
+    const dead = this.conversationDeadReason(sceneId);
+    if (dead) throw new Error(`Сцена не может продолжиться: ${dead}. Сбросьте сцену или начните новую.`);
     const run = this.ensureRun(sceneId);
     run.charIds = charIds;
     run.status = "running";
@@ -200,6 +237,8 @@ export class Engine {
     if (existing?.status === "running") return this.emitStatus(sceneId);
     if (!existing && scene.status !== "paused") throw new Error("Сцена не на паузе");
     const { charIds } = this.validate(sceneId);
+    const dead = this.conversationDeadReason(sceneId);
+    if (dead) throw new Error(`Сцена не может продолжиться: ${dead}. Сбросьте сцену или начните новую.`);
     const run = this.ensureRun(sceneId);
     run.charIds = charIds; // состав могли поменять, пока сцена стояла на паузе
     run.status = "running";
@@ -322,6 +361,37 @@ export class Engine {
       this.advance(sceneId, run);
       this.emitStatus(sceneId);
 
+      // Машиночитаемое завершение: все условия выполнены → сцена доигрывает
+      // ещё delayTurns ходов (пусть «процесс» случится) и завершается сама.
+      const sceneFin = getScene(sceneId);
+      const finCfg = sceneFin?.config.finish ?? null;
+      if (finCfg && finCfg.conditions.length > 0 && this.runs.get(sceneId) === run && run.status === "running") {
+        if (run.finishMetAtTurn == null && finishConditionsSatisfied(sceneId, finCfg)) {
+          run.finishMetAtTurn = run.turn;
+          getHub().emitEvent(
+            appendEvent(getDb(), sceneId, run.turn, "system", null, "all", {
+              message: `Условия завершения сцены достигнуты — сцена доигрывается ещё ${finCfg.delayTurns} ход(ов) и завершится.`,
+            })
+          );
+        }
+        if (
+          run.finishMetAtTurn != null &&
+          run.turn - run.finishMetAtTurn >= finCfg.delayTurns
+        ) {
+          run.status = "paused";
+          run.abort?.abort();
+          this.runs.delete(sceneId);
+          setSceneStatus(sceneId, "finished");
+          getHub().emitEvent(
+            appendEvent(getDb(), sceneId, run.turn, "system", null, "all", {
+              message: "Сцена завершена: условия завершения выполнены.",
+            })
+          );
+          this.emitStatus(sceneId);
+          return;
+        }
+      }
+
       // Опция «пауза для человека»: после полного круга ИИ ждём хода
       // режиссёра/игрока (реплика, действие или указание).
       const sceneNow = getScene(sceneId);
@@ -378,6 +448,7 @@ export class Engine {
     };
 
     const charId = run.charIds[run.index];
+    if (charId === undefined) return "ok"; // все ИИ-участники ушли: advance() завершит сцену
     const character = getCharacter(charId);
     if (!character) {
       appendEvent(db, sceneId, turnNo, "system", null, "all", {
@@ -398,19 +469,50 @@ export class Engine {
     const participants = participantIds
       .map((id) => getCharacter(id))
       .filter((c): c is Character => c !== null);
+
+    // Просроченные предложения сгорают: молчание цели — тоже ответ.
+    expireOffersForScene(sceneId, turnNo);
+
     const tools = getToolsByIds(character.toolIds);
     // Подсказка об исходах: незасекреченные требования дописываются в описание,
     // скрытые исходы модель узнаёт по факту (эпистемика сохраняется).
     const skillDefs = listSkills();
     const attrDefs = listAttributes();
+    const allTools = listTools();
+
+    // Списки существующих сущностей для enum-ов в схемах тулов: агент выбирает
+    // из реальных имён/ключей, а не гадает (ошибка = список допустимых).
+    const otherNames = participants.filter((p) => p.id !== character.id).map((p) => p.name);
+    const placeNames = listPlaces().map((p) => p.name);
+    const slotNames = listClothingSlots().map((s) => s.slot);
+    const hiddenAttrKeys = attrDefs.filter((a) => a.visibility === "hidden").map((a) => a.key);
+    const attrKeys = attrDefs.map((a) => a.key);
+    const products = listProducts();
+    const garments = listGarments();
+    const shopItemNames = [
+      ...products.map((p) => p.name),
+      ...garments.filter((g) => g.price > 0).map((g) => g.name),
+    ];
+    const enumCtx = {
+      participants: otherNames,
+      places: placeNames,
+      products: shopItemNames,
+      slots: slotNames,
+      attributes: attrKeys,
+    };
+
     const toolSpecs: ToolSpec[] = tools.map((t) => ({
       name: t.name,
       description:
         (t.cost > 0
           ? `${t.description || t.title || t.name} (цена: $${t.cost})`
-          : t.description || t.title || t.name) + outcomeHintText(t, skillDefs, attrDefs),
+          : t.description || t.title || t.name) +
+        outcomeHintText(t, skillDefs, attrDefs) +
+        (t.requiresConsent
+          ? " [ПРЕДЛОЖЕНИЕ: партнёр должен согласиться — вызов лишь отправляет предложение, действие произойдёт после согласия]"
+          : ""),
       parameters: t.parametersSchema?.type
-        ? t.parametersSchema
+        ? withEntityEnums(t.parametersSchema, t.targetParam, enumCtx)
         : { type: "object", properties: {} },
     }));
     // Виртуальный инструмент заявок: добавляется к тула персонажа, не хранится в БД.
@@ -418,38 +520,91 @@ export class Engine {
       toolSpecs.push({ ...REQUEST_TOOL_SPEC, parameters: { ...REQUEST_TOOL_SPEC.parameters } });
     }
     // Заявление о скрытой характеристике: доступно, когда в мире есть скрытое.
-    const hiddenPresent = hasHiddenAttributes();
+    const hiddenPresent = hiddenAttrKeys.length > 0;
     if (hiddenPresent) {
-      toolSpecs.push({ ...REVEAL_TOOL_SPEC, parameters: { ...REVEAL_TOOL_SPEC.parameters } });
+      toolSpecs.push(withSpecEnum(REVEAL_TOOL_SPEC, "attribute", hiddenAttrKeys));
     }
     // Одежда: доступна, когда в реестре есть слоты.
-    const clothingPresent = listClothingSlots().length > 0;
+    const clothingPresent = slotNames.length > 0;
     if (clothingPresent) {
       toolSpecs.push(
-        { ...UNDRESS_SPEC, parameters: { ...UNDRESS_SPEC.parameters } },
-        { ...WEAR_SPEC, parameters: { ...WEAR_SPEC.parameters } }
+        withSpecEnum(UNDRESS_SPEC, "slot", slotNames),
+        withSpecEnum(WEAR_SPEC, "slot", slotNames)
       );
     }
     // Места: go_to/invite доступны, когда в реестре есть хоть одно место.
-    if (listPlaces().length > 0) {
+    // Описания пересобираем на каждом ходу — места могли добавиться/переименоваться.
+    if (placeNames.length > 0) {
+      const listText = placeListText();
       toolSpecs.push(
-        { ...GO_SPEC, parameters: { ...GO_SPEC.parameters } },
-        { ...INVITE_SPEC, parameters: { ...INVITE_SPEC.parameters } }
+        withSpecEnum(
+          {
+            ...GO_SPEC,
+            description: `Отправиться в другое место — сцена продолжится там. Доступные места: ${listText}. Учти: другие участники отправляются вместе со сценой только своим согласием (своим go_to).`,
+          },
+          "place",
+          placeNames
+        ),
+        withSpecEnum(
+          withSpecEnum(
+            {
+              ...INVITE_SPEC,
+              description: `Пригласить персонажа в место — вежливая форма «поехали со мной». Приглашение доставляется лично; поедет ли человек, решает он (своим go_to). Доступные места: ${listText}`,
+            },
+            "to",
+            otherNames
+          ),
+          "place",
+          placeNames
+        )
       );
     }
-    // Виртуальные тулы магазина: появляются, когда в магазине есть товары.
-    const products = listProducts();
-    const shopAvailable = products.length > 0;
+    // Виртуальные тулы магазина: появляются, когда в магазине есть товары или одежда.
+    const shopAvailable = shopItemNames.length > 0;
     if (shopAvailable) {
       toolSpecs.push(
         { ...SHOP_BROWSE_SPEC, parameters: { ...SHOP_BROWSE_SPEC.parameters } },
-        { ...SHOP_BUY_SPEC, parameters: { ...SHOP_BUY_SPEC.parameters } }
+        withSpecEnum(withSpecEnum(SHOP_BUY_SPEC, "item", shopItemNames), "for", otherNames)
       );
     }
+    // Предложения, ждущие ответа ЭТОГО персонажа: тул ответа виден только ему.
+    const pendingIncoming = listPendingOffersForCharacter(sceneId, character.id);
+    if (pendingIncoming.length > 0) {
+      toolSpecs.push(
+        withSpecEnum(RESPOND_TOOL_SPEC, "offer", pendingIncoming.map((o) => String(o.id)))
+      );
+    }
+  // Стоп-инструменты: персонаж сам может прекратить общение (экономия токенов).
+  const stopsAllowed = scene.config.allowAgentStops !== false && participants.length > 1;
+  if (stopsAllowed) {
+    toolSpecs.push({ ...LEAVE_SPEC }, withSpecEnum(BLOCK_SPEC, "target", otherNames));
+  }
+  // Общение — только тулами: реплики текстом это мысли, их никто не слышит.
+  if (otherNames.length > 0) {
+    toolSpecs.push(
+      withSpecEnum(SAY_SPEC, "to", otherNames),
+      withSpecEnum(TEXT_SPEC, "to", otherNames)
+    );
+  }
+  // Личный гардероб: агент может посмотреть шкаф и переодеться.
+  const ownedGarments = listCharacterGarments(character.id);
+  if (ownedGarments.length > 0) {
+    toolSpecs.push(
+      { ...WARDROBE_BROWSE_SPEC },
+      withSpecEnum(WEAR_GARMENT_SPEC, "garment", ownedGarments.map((g) => g.name))
+    );
+  }
 
-    const visible = getVisibleEvents(sceneId, character.id, scene.config.contextEvents);
+    // Блокировки: события заблокированных друг другом участников не видны.
+    const blockedIds = blockedIdsFor(sceneId, character.id);
+    let visible = getVisibleEvents(sceneId, character.id, scene.config.contextEvents);
+    if (blockedIds.length > 0) {
+      visible = visible.filter((ev) => ev.actorId == null || !blockedIds.includes(ev.actorId));
+    }
     const goals = getSceneGoals(sceneId);
     const nameOf = (id: number) => participants.find((p) => p.id === id)?.name ?? `#${id}`;
+    const titleOfTool = (name: string) => allTools.find((t) => t.name === name)?.title || name;
+    const outgoing = listPendingOffersForScene(sceneId).filter((o) => o.fromId === character.id);
     const messages = buildMessages({
       character,
       scene,
@@ -460,11 +615,38 @@ export class Engine {
       hasPricedTools:
         tools.some((t) => t.cost > 0) || typeof character.state.money === "number",
       hasShop: shopAvailable,
-      attributeDefs: listAttributes(),
+      attributeDefs: attrDefs,
       relations: listRelationsOf(character.id).map((r) => ({ ...r, name: nameOf(r.toId) })),
       knowledge: knowledgeOf(character.id),
       hasHiddenAttributes: hiddenPresent,
       hasClothing: clothingPresent,
+      hasConsentTools:
+        tools.some((t) => t.requiresConsent) ||
+        pendingIncoming.length > 0 ||
+        outgoing.length > 0,
+      allowStops: stopsAllowed,
+      pendingOffers: pendingIncoming.map((o) => ({
+        id: o.id,
+        toolTitle: titleOfTool(o.toolName),
+        fromName: nameOf(o.fromId),
+      })),
+      outgoingOffers: outgoing.map((o) => ({
+        id: o.id,
+        toolTitle: titleOfTool(o.toolName),
+        toName: nameOf(o.toId),
+      })),
+      blockedNames: blockedIds.map((id) => nameOf(id)),
+      comboSecrets: listCombos()
+        .filter((c) => c.knowers.includes(character.id))
+        .map((c) => ({
+          title: c.title,
+          description: c.description,
+          steps: c.steps.map((s) =>
+            s.toolName +
+            (s.targetName ? ` → ${s.targetName}` : "") +
+            (s.actorName ? ` (${s.actorName})` : "")
+          ),
+        })),
     });
 
     run.abort = new AbortController();
@@ -472,6 +654,20 @@ export class Engine {
     let iteration = 0;
     let callSeq = 0;
     const genCallId = () => `call_${Date.now().toString(36)}_${turnNo}_${callSeq++}`;
+
+    // Страховочная модель персонажа: подхватывает ход, когда основная модель
+    // отказывается (цензура) или её ответ обрывается. Настраивается в редакторе
+    // персонажа; нет настройки — хода идут как раньше, без переноса.
+    const fallbackProvider =
+      character.fallbackProviderId != null ? getProvider(character.fallbackProviderId) : null;
+    const fallbackConfig: FallbackProviderConfig | null =
+      fallbackProvider && (fallbackProvider.kind === "mock" || character.fallbackModel.trim())
+        ? { provider: fallbackProvider, model: character.fallbackModel || "mock-actor" }
+        : null;
+    const primaryLabel = `${provider.name}:${character.model}`;
+    const fallbackLabel = fallbackConfig
+      ? `${fallbackConfig.provider.name}:${fallbackConfig.model}`
+      : primaryLabel;
 
     while (iteration < maxIter) {
       if (iteration > 0 && !alive()) break;
@@ -503,30 +699,60 @@ export class Engine {
       }
 
       let completion;
+      let usedFallback = false;
       const started = Date.now();
+      const requestJson = JSON.stringify({ model: character.model, messages, tools: toolSpecs });
       try {
-        completion = await chatCompletion({
-          provider,
-          model: character.model || "mock-actor",
-          messages,
-          tools: toolSpecs.length > 0 ? toolSpecs : undefined,
-          temperature: character.temperature,
-          maxTokens: character.maxTokens,
-          signal: AbortSignal.any([run.abort.signal, AbortSignal.timeout(MODEL_TIMEOUT_MS)]),
-          mockContext: {
-            actor: character.name,
-            others: participants.filter((p) => p.id !== character.id).map((p) => p.name),
-            tools: toolSpecs.map((t) => t.name),
-            shopItems: products.map((p) => p.name),
+        const outcome = await chatWithFallback(
+          {
+            provider,
+            model: character.model || "mock-actor",
+            messages,
+            tools: toolSpecs.length > 0 ? toolSpecs : undefined,
+            temperature: character.temperature,
+            maxTokens: character.maxTokens,
+            signal: AbortSignal.any([run.abort.signal, AbortSignal.timeout(MODEL_TIMEOUT_MS)]),
+            mockContext: {
+              actor: character.name,
+              others: participants.filter((p) => p.id !== character.id).map((p) => p.name),
+              tools: toolSpecs.map((t) => t.name),
+              shopItems: products.map((p) => p.name),
+            },
           },
-        });
+          fallbackConfig
+        );
+        completion = outcome.completion;
+        usedFallback = outcome.usedFallback;
+        // Отказ основной модели зафиксировать стоит отдельно: событие для
+        // архитектора (system не реконструируется в промпты) + лог + расход,
+        // чтобы бюджет считал обе попытки. Отказ в сцену не попадает.
+        if (usedFallback && outcome.primary) {
+          const p = outcome.primary;
+          appendApiLog(db, {
+            sceneId,
+            characterId: character.id,
+            turn: turnNo,
+            iteration,
+            model: primaryLabel,
+            requestJson,
+            responseJson: p.responseRaw == null ? null : JSON.stringify(p.responseRaw),
+            error: `отказ/обрыв основной модели: ${p.reason} → ход перенаправлен на ${fallbackLabel}`,
+            latencyMs: p.latencyMs,
+          });
+          incrementSceneSpend(sceneId, 1, p.usageTokens);
+          getHub().emitEvent(
+            appendEvent(db, sceneId, turnNo, "system", character.id, "all", {
+              message: `Страховочная модель: ${primaryLabel} — ${p.reason}. Ход ${character.name} выполнен через ${fallbackLabel}.`,
+            })
+          );
+        }
         appendApiLog(db, {
           sceneId,
           characterId: character.id,
           turn: turnNo,
           iteration,
-          model: `${provider.name}:${character.model}`,
-          requestJson: JSON.stringify({ model: character.model, messages, tools: toolSpecs }),
+          model: usedFallback ? fallbackLabel : primaryLabel,
+          requestJson,
           responseJson: JSON.stringify(completion.raw),
           error: null,
           latencyMs: Date.now() - started,
@@ -546,8 +772,8 @@ export class Engine {
           characterId: character.id,
           turn: turnNo,
           iteration,
-          model: `${provider.name}:${character.model}`,
-          requestJson: JSON.stringify({ model: character.model, messages, tools: toolSpecs }),
+          model: usedFallback ? fallbackLabel : primaryLabel,
+          requestJson,
           responseJson: null,
           error: e instanceof Error ? e.message : String(e),
           latencyMs: Date.now() - started,
@@ -626,13 +852,41 @@ export class Engine {
             callResult = handled.call;
             if (handled.created) getHub().emitToolRequests(sceneId);
           } else if (
+            toolName === RESPOND_TOOL_NAME ||
+            toolName === LEAVE_SCENE_TOOL_NAME ||
+            toolName === BLOCK_TOOL_NAME
+          ) {
+            // Управляющие тулы сцены (ответ на предложение / уход / блокировка).
+            const fresh = getCharacter(character.id) ?? character;
+            const res = this.runSceneControlTool(sceneId, turnNo, fresh, participants, toolName, args);
+            callResult = res.call;
+            stateChanges.push(...res.stateChanges);
+            relationChanges.push(...res.relationChanges);
+            if (res.sceneEnded) {
+              // Сцена завершена прямо в этом ходу: фиксируем событие и выходим.
+              getHub().emitEvent(
+                appendEvent(db, sceneId, turnNo, "action", character.id, callResult.audience, {
+                  iteration,
+                  calls: [callResult],
+                  stateChanges: stateChanges.length > 0 ? stateChanges : undefined,
+                  relationChanges: relationChanges.length > 0 ? relationChanges : undefined,
+                })
+              );
+              this.emitStatus(sceneId);
+              return "aborted";
+            }
+          } else if (
             toolName === SHOP_BROWSE_TOOL ||
             toolName === SHOP_BUY_TOOL ||
             toolName === REVEAL_TOOL_NAME ||
             toolName === UNDRESS_TOOL_NAME ||
             toolName === WEAR_TOOL_NAME ||
             toolName === GO_TOOL_NAME ||
-            toolName === INVITE_TOOL_NAME
+            toolName === INVITE_TOOL_NAME ||
+            toolName === SAY_TOOL_NAME ||
+            toolName === TEXT_TOOL_NAME ||
+            toolName === WARDROBE_BROWSE_TOOL_NAME ||
+            toolName === WEAR_GARMENT_TOOL_NAME
           ) {
             // Виртуальные тулы (магазин/заявления/одежда): не хранятся в БД.
             const fresh = getCharacter(character.id) ?? character;
@@ -663,7 +917,17 @@ export class Engine {
             };
           } else {
             const freshChar = getCharacter(character.id) ?? character;
-            const ex = executeTool({ tool, actor: freshChar, participants, args, scene });
+            // Валидируем args против схемы с enum-ами (та же, что видела модель):
+            // агент, проигнорировавший список, получит ошибку с допустимыми значениями.
+            const liveSpec = toolSpecs.find((s) => s.name === toolName);
+            const ex = executeTool({
+              tool: liveSpec ? { ...tool, parametersSchema: liveSpec.parameters } : tool,
+              actor: freshChar,
+              participants,
+              args,
+              scene,
+              turn: turnNo,
+            });
             relationChanges.push(...ex.relationChanges);
             // Анти-спам: то же действие те же параметры несколько раз подряд.
             const repeatKey = `${toolName}|${JSON.stringify(args)}`;
@@ -681,8 +945,30 @@ export class Engine {
               observation: ex.observation,
               audience: ex.audience,
               outcome: ex.outcome?.outcomeId,
+              targetId: ex.targetId,
+              offered: ex.offered || undefined,
             };
             stateChanges.push(...ex.stateChanges);
+            // Комбо: точная последовательность успешных действий может дать
+            // скрытый результат (секрет знают только те, кто в knowers).
+            if (ex.ok && !ex.offered) {
+              const comboTarget =
+                tool.audience === "target" && tool.targetParam
+                  ? resolveTargetByName(participants, args[tool.targetParam])
+                  : null;
+              const fired = checkCombos({
+                sceneId,
+                turn: turnNo,
+                actor: freshChar,
+                toolName,
+                target: comboTarget,
+              });
+              for (const f of fired) {
+                callResult = { ...callResult, result: callResult.result + f.resultNote };
+                stateChanges.push(...f.stateChanges);
+                relationChanges.push(...f.relationChanges);
+              }
+            }
             // Сработавший исход: заметка доставляется цели лично, от лица мира.
             if (ex.outcome) {
               getHub().emitEvent(
@@ -760,6 +1046,15 @@ export class Engine {
             content: c.result,
           });
         }
+        // Между итерациями НЕТ новых реплик других участников (они ходят
+        // отдельно) — без этой ремарки модели выдумывают ответ собеседника
+        // и строчат сообщения подряд. Ремарка фактологична всегда.
+        messages.push({
+          role: "user",
+          content:
+            "(Твой ход продолжается. Другие участники сейчас НЕ отвечали — их реплики будут в их собственных ходах, не выдумывай их. " +
+            "Если сообщение уже отправлено — лучше заверши ход и дождись ответа; продолжай только если есть что добавить.)",
+        });
         iteration += 1;
         // Небольшая пауза между итерациями — чтобы модель не молотила запросы.
         await this.sleep(ITER_DELAY_MS, run);
@@ -828,6 +1123,150 @@ export class Engine {
     } catch {
       // нет провайдера/ИИ-участников — молча остаёмся на месте
     }
+  }
+
+  /**
+   * Управляющие тулы сцены: ответ на предложение (respond_to_offer),
+   * уход (leave_scene) и блокировка (block_character). Единый путь для
+   * модельного вызова и ручного act(). События исполненного по согласию
+   * действия и личные уведомления создаёт сам исполнитель (offers/stops).
+   */
+  private runSceneControlTool(
+    sceneId: number,
+    turn: number,
+    character: Character,
+    participants: Character[],
+    toolName: string,
+    args: Record<string, unknown>
+  ): {
+    call: ActionCall;
+    stateChanges: { characterId: number; key: string; value: unknown }[];
+    relationChanges: { fromId: number; toId: number; value: number }[];
+    sceneEnded?: boolean;
+  } {
+    if (toolName === RESPOND_TOOL_NAME) {
+      const scene = getScene(sceneId);
+      const r = executeRespond({
+        sceneId,
+        turn,
+        responder: character,
+        participants,
+        args,
+        execTool: (tool, actor, toolArgs) =>
+          executeTool({
+            tool,
+            actor,
+            participants,
+            args: toolArgs,
+            scene,
+            turn,
+            skipConsent: true,
+          }),
+        // Комбо: исполнение по согласию — полноправный шаг цепочки.
+        onExecuted: (tool, actor, ex) => {
+          const target =
+            ex.targetId != null ? (participants.find((p) => p.id === ex.targetId) ?? null) : null;
+          const fired = checkCombos({ sceneId, turn, actor, toolName: tool.name, target });
+          return {
+            note: fired.map((f) => f.resultNote).join(""),
+            stateChanges: fired.flatMap((f) => f.stateChanges),
+            relationChanges: fired.flatMap((f) => f.relationChanges),
+          };
+        },
+      });
+      return { call: r.call, stateChanges: r.stateChanges, relationChanges: r.relationChanges };
+    }
+    if (toolName === LEAVE_SCENE_TOOL_NAME) {
+      const r = executeLeave({ sceneId, turn, actor: character, participants, args });
+      const sceneEnded = this.dropParticipantAndFinishIfLonely(sceneId, turn, r.leftCharId!);
+      return {
+        call: r.call,
+        stateChanges: r.stateChanges,
+        relationChanges: r.relationChanges,
+        sceneEnded,
+      };
+    }
+    if (toolName === BLOCK_TOOL_NAME) {
+      const r = executeBlock({ sceneId, turn, actor: character, participants, args });
+      const sceneEnded = r.blockedPair ? this.finishIfNoConversation(sceneId, turn) : false;
+      return {
+        call: r.call,
+        stateChanges: r.stateChanges,
+        relationChanges: r.relationChanges,
+        sceneEnded,
+      };
+    }
+    throw new Error(`Неизвестный управляющий инструмент ${toolName}`);
+  }
+
+  /**
+   * Убрать ушедшего из ротации хода и сжечь его предложения. Если после
+   * ухода (с учётом блокировок) общаться больше не с кем — сцена завершается.
+   */
+  private dropParticipantAndFinishIfLonely(
+    sceneId: number,
+    turn: number,
+    charId: number
+  ): boolean {
+    const run = this.runs.get(sceneId);
+    if (run) {
+      const i = run.charIds.indexOf(charId);
+      if (i >= 0) {
+        run.charIds.splice(i, 1);
+        // Индекс подводим так, чтобы advance() выдал ход следующему по порядку.
+        if (i < run.index) run.index -= 1;
+        else if (i === run.index && run.charIds.length > 0)
+          run.index = (run.index - 1 + run.charIds.length) % run.charIds.length;
+      }
+    }
+    for (const o of listPendingOffersForScene(sceneId)) {
+      if (o.fromId === charId || o.toId === charId) setOfferStatus(o.id, "expired", null);
+    }
+    return this.finishIfNoConversation(sceneId, turn);
+  }
+
+  /**
+   * Причина, почему общение в сцене невозможно (ушли или переблокировали всех),
+   * или null, если разговор ещё жив. Свежая сольная сцена — не «мёртвая»:
+   * смерти предшествует хотя бы один уход/блокировка.
+   */
+  private conversationDeadReason(sceneId: number): string | null {
+    const leftIds = new Set(getSceneLeftIds(sceneId));
+    const blocks = listSceneBlocks(sceneId);
+    if (leftIds.size === 0 && blocks.length === 0) return null;
+    const participants = getSceneParticipants(sceneId)
+      .map((id) => getCharacter(id))
+      .filter((c): c is Character => c !== null && !leftIds.has(c.id));
+    if (participants.length < 2) return "участников меньше двух";
+    for (let i = 0; i < participants.length; i++) {
+      for (let j = i + 1; j < participants.length; j++) {
+        if (!isPairBlocked(sceneId, participants[i].id, participants[j].id)) return null;
+      }
+    }
+    return "общение прекратилось (уходы и блокировки)";
+  }
+
+  /**
+   * Есть ли в сцене ещё живая (незаблокированная, не ушедшая) пара участников.
+   * Если нет — генерация бессмысленна: сцена завершается, токены экономятся.
+   */
+  private finishIfNoConversation(sceneId: number, turn: number): boolean {
+    const reason = this.conversationDeadReason(sceneId);
+    if (reason == null) return false;
+    const run = this.runs.get(sceneId);
+    if (run) {
+      run.status = "paused";
+      run.abort?.abort();
+      this.runs.delete(sceneId);
+    }
+    setSceneStatus(sceneId, "finished");
+    getHub().emitEvent(
+      appendEvent(getDb(), sceneId, turn, "system", null, "all", {
+        message: `Сцена завершена: ${reason}.`,
+      })
+    );
+    this.emitStatus(sceneId);
+    return true;
   }
 
   /**
@@ -981,6 +1420,69 @@ export class Engine {
         relationChanges: [],
       };
     }
+    if (toolName === SAY_TOOL_NAME) {
+      const ex = executeSay({ actor: character, participants, args });
+      return {
+        call: {
+          callId,
+          toolName,
+          args,
+          ok: ex.ok,
+          result: ex.result,
+          observation: ex.observation,
+          audience: ex.audience,
+        },
+        stateChanges: [],
+        relationChanges: [],
+      };
+    }
+    if (toolName === TEXT_TOOL_NAME) {
+      const ex = executeTextMessage({ actor: character, participants, args });
+      return {
+        call: {
+          callId,
+          toolName,
+          args,
+          ok: ex.ok,
+          result: ex.result,
+          observation: ex.observation,
+          audience: ex.audience,
+        },
+        stateChanges: [],
+        relationChanges: [],
+      };
+    }
+    if (toolName === WARDROBE_BROWSE_TOOL_NAME) {
+      return {
+        call: {
+          callId,
+          toolName,
+          args,
+          ok: true,
+          result: wardrobeTextFor(character),
+          observation: "",
+          audience: [character.id],
+        },
+        stateChanges: [],
+        relationChanges: [],
+      };
+    }
+    if (toolName === WEAR_GARMENT_TOOL_NAME) {
+      const ex = wearOwnedGarment({ actor: character, args });
+      return {
+        call: {
+          callId,
+          toolName,
+          args,
+          ok: ex.ok,
+          result: ex.result,
+          observation: ex.observation,
+          audience: ex.ok ? "all" : "none",
+        },
+        stateChanges: ex.stateChanges,
+        relationChanges: [],
+      };
+    }
     return none;
   }
 
@@ -1007,13 +1509,36 @@ export class Engine {
 
     // Виртуальные тулы доступны всем и без привязки в toolIds.
     if (
+      toolName === RESPOND_TOOL_NAME ||
+      toolName === LEAVE_SCENE_TOOL_NAME ||
+      toolName === BLOCK_TOOL_NAME
+    ) {
+      // Управляющие тулы сцены: тот же путь, что и у модели (единая механика).
+      const res = this.runSceneControlTool(sceneId, turn, character, participants, toolName, args);
+      const ev = appendEvent(getDb(), sceneId, turn, "action", character.id, res.call.audience, {
+        iteration: -1,
+        calls: [res.call],
+        stateChanges: res.stateChanges.length > 0 ? res.stateChanges : undefined,
+        relationChanges: res.relationChanges.length > 0 ? res.relationChanges : undefined,
+      });
+      getHub().emitEvent(ev);
+      if (res.stateChanges.length > 0 || res.relationChanges.length > 0)
+        getHub().emitParticipants(sceneId);
+      this.autoResume(sceneId);
+      return { event: ev, ok: res.call.ok, result: res.call.result };
+    }
+    if (
       toolName === SHOP_BROWSE_TOOL ||
       toolName === SHOP_BUY_TOOL ||
       toolName === REVEAL_TOOL_NAME ||
       toolName === UNDRESS_TOOL_NAME ||
       toolName === WEAR_TOOL_NAME ||
       toolName === GO_TOOL_NAME ||
-      toolName === INVITE_TOOL_NAME
+      toolName === INVITE_TOOL_NAME ||
+      toolName === SAY_TOOL_NAME ||
+      toolName === TEXT_TOOL_NAME ||
+      toolName === WARDROBE_BROWSE_TOOL_NAME ||
+      toolName === WEAR_GARMENT_TOOL_NAME
     ) {
       const vir = this.runVirtualTool(sceneId, turn, character, participants, toolName, args);
       const ev = appendEvent(getDb(), sceneId, turn, "action", character.id, vir.call.audience, {
@@ -1036,7 +1561,18 @@ export class Engine {
       throw new Error(`Инструмент "${toolName}" недоступен персонажу. Доступны: ${available}`);
     }
 
-    const ex = executeTool({ tool, actor: character, participants, args, scene });
+    const ex = executeTool({ tool, actor: character, participants, args, scene, turn });
+    let actResult = ex.result;
+    // Комбо при ручном действии — тот же путь, что и у модели.
+    if (ex.ok && !ex.offered) {
+      const comboTarget =
+        tool.audience === "target" && tool.targetParam
+          ? resolveTargetByName(participants, args[tool.targetParam])
+          : null;
+      for (const f of checkCombos({ sceneId, turn, actor: character, toolName, target: comboTarget })) {
+        actResult += f.resultNote;
+      }
+    }
     const callId = `manual_${Date.now().toString(36)}`;
     const ev = appendEvent(getDb(), sceneId, turn, "action", character.id, ex.audience, {
       iteration: -1,
@@ -1046,10 +1582,12 @@ export class Engine {
           toolName,
           args,
           ok: ex.ok,
-          result: ex.result,
+          result: actResult,
           observation: ex.observation,
           audience: ex.audience,
           outcome: ex.outcome?.outcomeId,
+          targetId: ex.targetId,
+          offered: ex.offered || undefined,
         },
       ],
       stateChanges: ex.stateChanges.length > 0 ? ex.stateChanges : undefined,
@@ -1075,7 +1613,7 @@ export class Engine {
     if (ex.stateChanges.length > 0 || ex.relationChanges.length > 0)
       getHub().emitParticipants(sceneId);
     this.autoResume(sceneId);
-    return { event: ev, ok: ex.ok, result: ex.result };
+    return { event: ev, ok: ex.ok, result: actResult };
   }
 }
 
@@ -1089,9 +1627,11 @@ function requireSceneCharacter(sceneId: number, characterId: number): Character 
   return character;
 }
 
-/** id ИИ-персонажей сцены (люди в ротацию ходов не попадают). */
+/** id ИИ-персонажей сцены (люди и ушедшие через leave_scene в ротацию не попадают). */
 function aiParticipantIds(sceneId: number): number[] {
+  const left = new Set(getSceneLeftIds(sceneId));
   return getSceneParticipants(sceneId).filter((id) => {
+    if (left.has(id)) return false;
     const c = getCharacter(id);
     return c != null && !c.isHuman;
   });
@@ -1107,6 +1647,74 @@ function mergeAudiences(list: Audience[]): Audience {
   if (sawAll) return "all";
   if (ids.size === 0) return "none";
   return [...ids];
+}
+
+/** Глубокий клон JSON-схемы параметров (enum-ы пишем в клон, не в спецификацию). */
+function cloneParams(p: Record<string, unknown> | undefined): Record<string, unknown> {
+  return JSON.parse(JSON.stringify(p ?? { type: "object", properties: {} })) as Record<
+    string,
+    unknown
+  >;
+}
+
+/** Клон спецификации с enum допустимых значений одного параметра. */
+function withSpecEnum(spec: ToolSpec, param: string, values: string[]): ToolSpec {
+  const parameters = cloneParams(spec.parameters);
+  if (values.length > 0) {
+    const props = (parameters.properties ?? (parameters.properties = {})) as Record<
+      string,
+      Record<string, unknown>
+    >;
+    props[param] = { ...(props[param] ?? { type: "string" }), enum: values };
+  }
+  return { ...spec, parameters };
+}
+
+interface EntityEnumCtx {
+  participants: string[];
+  places: string[];
+  products: string[];
+  slots: string[];
+  attributes: string[];
+}
+
+/**
+ * enum-ы для схемы DB-тула: получатель (targetParam) — имена участников;
+ * свойства с x-entity ("character"|"place"|"product"|"slot"|"attribute")
+ * получают списки существующих сущностей мира. Агент выбирает, а не гадает.
+ */
+function withEntityEnums(
+  schema: Record<string, unknown>,
+  targetParam: string | null,
+  ctx: EntityEnumCtx
+): Record<string, unknown> {
+  const params = cloneParams(schema);
+  const props = (params.properties ?? (params.properties = {})) as Record<
+    string,
+    Record<string, unknown>
+  >;
+  if (targetParam && props[targetParam] && ctx.participants.length > 0) {
+    props[targetParam] = { ...props[targetParam], enum: ctx.participants };
+  }
+  for (const def of Object.values(props)) {
+    const ref = def?.["x-entity"];
+    if (typeof ref !== "string") continue;
+    delete def["x-entity"];
+    const values =
+      ref === "character"
+        ? ctx.participants
+        : ref === "place"
+          ? ctx.places
+          : ref === "product" || ref === "garment"
+            ? ctx.products
+            : ref === "slot"
+              ? ctx.slots
+              : ref === "attribute"
+                ? ctx.attributes
+                : null;
+    if (values && values.length > 0) def.enum = values;
+  }
+  return params;
 }
 
 /**

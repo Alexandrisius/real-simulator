@@ -77,7 +77,18 @@ export function executeReveal(input: {
   const { actor, participants, args } = input;
   const defs = listAttributes();
   const attr = resolveAttributeKey(args.attribute, defs);
-  const label = attr ? `${attr.emoji ? attr.emoji + " " : ""}${attr.label}` : String(args.attribute ?? "?");
+  if (!attr) {
+    // Агент должен заявлять о существующих характеристиках реестра:
+    // выдуманный ключ — ошибка со списком допустимых, а не мусор в knowledge.
+    const list = defs.map((d) => d.key).join(", ") || "(реестр пуст)";
+    return {
+      ok: false,
+      result: `Неизвестная характеристика «${String(args.attribute ?? "?")}». Выбери из существующих: ${list}`,
+      observation: "",
+      audience: "none",
+    };
+  }
+  const label = `${attr.emoji ? attr.emoji + " " : ""}${attr.label}`;
 
   const rawValue = args.value;
   if (rawValue === undefined || rawValue === null || rawValue === "") {
@@ -114,7 +125,7 @@ export function executeReveal(input: {
 
   for (const l of listeners) {
     if (l.id === actor.id) continue;
-    upsertClaim({ observerId: l.id, subjectId: actor.id, key: attr?.key ?? String(args.attribute), value });
+    upsertClaim({ observerId: l.id, subjectId: actor.id, key: attr.key, value });
   }
 
   const observation = `${actor.name} говорит: мой(я) ${label} — ${String(value)}`;

@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { CheckCircle2, Plug, Plus, ShieldAlert, Trash2, XCircle } from "lucide-react";
 import {
   Badge,
@@ -63,6 +63,8 @@ export default function ProvidersPage() {
   const [tests, setTests] = useState<Record<number, "loading" | TestResult>>({});
   const [insecureTls, setInsecureTls] = useState(false);
   const [tlsBusy, setTlsBusy] = useState(false);
+  // Реф карточки формы: «Изменить» открывает форму наверху страницы — прокручиваем к ней
+  const formRef = useRef<HTMLDivElement>(null);
 
   const load = useCallback(() => {
     api<Provider[]>("/api/providers").then(setProviders).catch((e) => setError(e.message));
@@ -99,6 +101,9 @@ export default function ProvidersPage() {
     setEditingId(p.id);
     setForm({ name: p.name, kind: p.kind, baseUrl: p.baseUrl, apiKey: p.apiKey });
     setFormOpen(true);
+    requestAnimationFrame(() =>
+      formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+    );
   };
 
   const save = async () => {
@@ -158,6 +163,7 @@ export default function ProvidersPage() {
       <ErrorText>{error}</ErrorText>
 
       {(formOpen || editingId !== null) && (
+        <div ref={formRef}>
         <Card className="mb-6 p-5">
           <div className="mb-4 text-sm font-medium">
             {editingId ? "Редактирование провайдера" : "Новый провайдер"}
@@ -216,6 +222,7 @@ export default function ProvidersPage() {
             </Btn>
           </div>
         </Card>
+        </div>
       )}
 
       {providers.length === 0 ? (

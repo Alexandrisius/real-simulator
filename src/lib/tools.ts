@@ -30,6 +30,7 @@ import {
   setRelation,
   updateCharacter,
 } from "@/db/queries";
+import { createOfferProposal } from "./offers";
 
 export interface ToolExecInput {
   tool: Tool;
@@ -39,6 +40,10 @@ export interface ToolExecInput {
   args: Record<string, unknown>;
   /** Сцена исполнения (место — для границ и одежды); null = без контекста места */
   scene: Scene | null;
+  /** Номер хода (для предложений): нужен, чтобы датировать offer */
+  turn?: number;
+  /** Исполнение по согласию: предложение уже принято, не создавать новое */
+  skipConsent?: boolean;
 }
 
 export interface ToolExecResult {
@@ -48,6 +53,8 @@ export interface ToolExecResult {
   /** Наблюдение для остальных участников */
   observation: string;
   audience: Audience;
+  /** id разрешённого получателя адресного тула (null/undefined = без цели) */
+  targetId?: number;
   stateChanges: { characterId: number; key: string; value: unknown }[];
   /** Изменения отношений: fromId испытывает чувство к toId, value — новое значение */
   relationChanges: { fromId: number; toId: number; value: number }[];
@@ -59,6 +66,8 @@ export interface ToolExecResult {
   skillUps?: SkillUp[];
   /** Сработавший исход (условия → эффекты + заметка цели); заметку движок доставляет лично */
   outcome?: OutcomeFired;
+  /** true = вместо исполнения создано предложение (тул требует согласия) */
+  offered?: boolean;
 }
 
 /** Разрешение получателя по имени (используется и магазином). */
@@ -72,13 +81,20 @@ export function resolveTargetByName(participants: Character[], name: unknown): C
   );
 }
 
-/** Минимальная валидация args против JSON Schema (типы + required). */
+/**
+ * Минимальная валидация args против JSON Schema (типы + required + enum).
+ * Enum в схеме — список допустимых значений (движок подставляет туда имена
+ * существующих сущностей): несуществующее имя — ошибка со списком вариантов.
+ */
 export function validateArgs(
   schema: Record<string, unknown>,
   args: Record<string, unknown>
 ): string | null {
   if (schema.type === "object" || schema.properties) {
-    const props = (schema.properties ?? {}) as Record<string, { type?: string }>;
+    const props = (schema.properties ?? {}) as Record<
+      string,
+      { type?: string; enum?: unknown[] }
+    >;
     for (const key of (schema.required ?? []) as string[]) {
       const v = args[key];
       if (v === undefined || v === null || v === "") return `Не хватает обязательного параметра "${key}"`;
@@ -86,6 +102,18 @@ export function validateArgs(
       if (t === "string" && typeof v !== "string") return `Параметр "${key}" должен быть строкой`;
       if (t === "number" && typeof v !== "number") return `Параметр "${key}" должен быть числом`;
       if (t === "boolean" && typeof v !== "boolean") return `Параметр "${key}" должен быть булевым`;
+    }
+    // Enum-членство: для каждого переданного параметра, у которого в схеме
+    // есть enum (движок кладёт туда реальные сущности сцены/мира).
+    for (const [key, def] of Object.entries(props)) {
+      if (!Array.isArray(def.enum) || def.enum.length === 0) continue;
+      const v = args[key];
+      if (v === undefined || v === null || v === "") continue;
+      if (!def.enum.includes(v as never)) {
+        return `Параметр "${key}" = "${String(v)}" не существует. Выбери из: ${def.enum
+          .map((x) => String(x))
+          .join(", ")}`;
+      }
     }
   }
   return null;
@@ -282,68 +310,107 @@ function applySkillPractice(
 }
 
 /**
- * Проверка границ цели: адресный тул против правил согласия владельца.
- * Возвращает null, если всё в порядке, или текст причины отказа.
- * Проверяется истинное состояние (физика), а не заявления: requireAttr
- * смотрит настоящий state актёра/цели — обмануть словами нельзя.
+ * Проверка границ: правила согласия участников против адресного вызова.
+ * Возвращает null, если всё в порядке, или текст причины отказа. Правило —
+ * произвольный список условий («И», types:BoundaryCondition), проверяется по
+ * порядку над ИСТИННЫМ состоянием (физика), а не заявлениям: обмануть словами
+ * нельзя. Пустой список условий — правило проходит всегда.
+ *
+ * ownerIsActor: правило принадлежит самому актёру (scope outgoing/both) —
+ * «моё собственное правило на мои действия». Роли в условиях всегда
+ * относительны вызова: actor — кто вызывает, target — на кого.
  */
 function boundaryViolation(
   rule: Boundary,
   input: ToolExecInput,
-  target: Character
+  target: Character,
+  ownerIsActor = false
 ): string | null {
-  const { tool, actor, scene } = input;
-  if (rule.minRelation != null) {
-    if (getRelation(target.id, actor.id) < rule.minRelation) {
-      return `отношение ${target.name} к тебе ниже нужного (${getRelation(target.id, actor.id)} < ${rule.minRelation})`;
-    }
-  }
-  if (rule.minMood != null) {
-    const mood = typeof target.state.mood === "number" ? (target.state.mood as number) : 0;
-    if (mood < rule.minMood) {
-      return `у ${target.name} не то настроение (mood ${mood} < ${rule.minMood})`;
-    }
-  }
-  if (rule.requirePlace) {
-    const place = (scene?.config.place ?? "").trim().toLowerCase();
-    if (place !== rule.requirePlace.trim().toLowerCase()) {
-      return `не то место (нужно: ${rule.requirePlace}, а сейчас: ${place || "не задано"})`;
-    }
-  }
-  if (rule.requireAttr) {
-    const owner = rule.requireAttr.owner === "actor" ? actor : target;
-    const v = owner.state[rule.requireAttr.key];
-    if (typeof v !== "number") return `у ${owner.name} нет заданной характеристики "${rule.requireAttr.key}"`;
-    const okAttr =
-      rule.requireAttr.op === ">=" ? v >= rule.requireAttr.value : v === rule.requireAttr.value;
-    if (!okAttr) {
-      return `характеристика "${rule.requireAttr.key}" ${owner.name} не проходит проверку (${v} ${rule.requireAttr.op} ${rule.requireAttr.value})`;
+  const { actor, scene } = input;
+  // Хозяин правила и «другой» участник пары: для входящего правила хозяин —
+  // цель вызова, для исходящего (своего) — сам актёр.
+  const owner = ownerIsActor ? actor : target;
+  const other = ownerIsActor ? target : actor;
+  for (const cond of rule.conditions ?? []) {
+    switch (cond.kind) {
+      case "relation": {
+        // Отношение ВЛАДЕЛЬЦА границы к другому участнику (системная матрица).
+        const rel = getRelation(owner.id, other.id);
+        const ok =
+          cond.op === ">=" ? rel >= cond.value : cond.op === "<" ? rel < cond.value : rel === cond.value;
+        if (ok) break;
+        // Чужие чувства — приватны: без точных цифр, только сигнал.
+        if (cond.op === "<") {
+          return `отношение ${owner.name} к тебе недостаточно прохладное`;
+        }
+        if (cond.op === "=") {
+          return `отношение ${owner.name} к тебе не равно нужному`;
+        }
+        return `отношение ${owner.name} к тебе ещё не доросло до нужного`;
+      }
+      case "attr": {
+        // Истинный state участника условия (актёра вызова или его цели):
+        // отсутствующая числовая характеристика считается нулём.
+        const who = cond.owner === "actor" ? actor : target;
+        const raw = who.state[cond.key];
+        const num = typeof raw === "number" ? raw : 0;
+        const ok =
+          cond.op === ">=" ? num >= cond.value : cond.op === "<" ? num < cond.value : num === cond.value;
+        if (ok) break;
+        // Название характеристики — из реестра (неизвестный ключ показываем как есть).
+        const def = listAttributes().find((d) => d.key === cond.key);
+        const label = def ? def.label : cond.key;
+        // Скрытые характеристики не раскрываем цифрами: сам факт отказа уже
+        // сигнал («не дотягивает»), точное значение — эпистемическая утечка.
+        const masked = def?.visibility === "hidden";
+        if (cond.op === "<") {
+          return `у ${who.name} «${label}» не ниже нужного${masked ? "" : ` (${num} ≥ ${cond.value})`}`;
+        }
+        if (cond.op === "=") {
+          return `у ${who.name} «${label}» не то значение${masked ? "" : ` (${num} ≠ ${cond.value})`}`;
+        }
+        return `у ${who.name} «${label}» ниже нужного${masked ? "" : ` (${num} < ${cond.value})`}`;
+      }
+      case "place": {
+        // Место сцены, сравнение без учёта регистра.
+        const place = (scene?.config.place ?? "").trim().toLowerCase();
+        if (place === cond.place.trim().toLowerCase()) break;
+        return `не то место (нужно: ${cond.place}, а сейчас: ${place || "не задано"})`;
+      }
+      case "worn": {
+        // Слот одежды ВЛАДЕЛЬЦА правила: пустой = нет непустой строки worn_<слот>.
+        const v = owner.state["worn_" + cond.slot];
+        const bare = !(typeof v === "string" && v.trim() !== "");
+        if (bare === cond.bare) break;
+        return `слот ${cond.slot} ${owner.name} должен быть ${cond.bare ? "пуст" : "занят"}`;
+      }
     }
   }
   return null;
 }
 
-/** Применить эффекты нарушения границы: отношение цели к актёру и state цели. */
+/** Применить эффекты нарушения границы: отношение владельца правила к другому и state владельца. */
 function applyBoundaryEffects(
   rule: Boundary,
   actor: Character,
-  target: Character
+  target: Character,
+  refuser: Character
 ): {
   stateChanges: ToolExecResult["stateChanges"];
   relationChanges: ToolExecResult["relationChanges"];
 } {
   const stateChanges: ToolExecResult["stateChanges"] = [];
   const relationChanges: ToolExecResult["relationChanges"] = [];
-  const state = { ...target.state };
+  const state = { ...refuser.state };
   let dirty = false;
   for (const eff of rule.effects) {
     if (eff.target === "relation") {
       const delta = typeof eff.value === "number" ? eff.value : Number(eff.value) || 0;
-      const next = eff.op === "set" ? delta : getRelation(target.id, actor.id) + delta;
-      setRelation(target.id, actor.id, next);
-      relationChanges.push({ fromId: target.id, toId: actor.id, value: next });
+      const next = eff.op === "set" ? delta : getRelation(refuser.id, actor.id) + delta;
+      setRelation(refuser.id, actor.id, next);
+      relationChanges.push({ fromId: refuser.id, toId: actor.id, value: next });
     } else {
-      // Эффектов нарушения на актёра нет — наказание социальное: цель и её чувства.
+      // Эффектов нарушения на инициатора нет — наказание социальное: владелец и его чувства.
       if (eff.op === "set") {
         state[eff.key] = eff.value;
       } else {
@@ -351,12 +418,12 @@ function applyBoundaryEffects(
         const delta = typeof eff.value === "number" ? eff.value : Number(eff.value) || 0;
         state[eff.key] = curVal + delta;
       }
-      stateChanges.push({ characterId: target.id, key: eff.key, value: state[eff.key] });
+      stateChanges.push({ characterId: refuser.id, key: eff.key, value: state[eff.key] });
       dirty = true;
     }
   }
   if (dirty)
-    updateCharacter(target.id, { state: clampStateValues(state, listAttributes()) });
+    updateCharacter(refuser.id, { state: clampStateValues(state, listAttributes()) });
   return { stateChanges, relationChanges };
 }
 
@@ -404,32 +471,54 @@ export function executeTool(input: ToolExecInput): ToolExecResult {
     audience = "none";
   }
 
-  // Границы цели (согласие): проверяем ДО денег и эффектов. Отказ = действие
-  // не исполняется, деньги целы, применяется социальное наказание цели.
+  // Границы (согласие): проверяем ДО денег и эффектов. Отказ = действие
+  // не исполняется, деньги целы, применяется социальное наказание владельца.
+  // Две стороны: incoming-правила ЦЕЛИ («кто делает это со мной») и
+  // outgoing-правила АКТЁРА («с кем я сам это делаю»). Результат отказа
+  // виден только инициатору: причина может называть скрытые вещи —
+  // ни цель, ни остальные участники чужих отказов не видят.
   if (tool.audience === "target" && targetChar && targetChar.id !== actor.id) {
-    const rules = targetChar.boundaries.filter(
-      (b) => b.toolName === tool.name || b.toolName === "*"
-    );
-    for (const rule of rules) {
-      const reason = boundaryViolation(rule, input, targetChar);
+    const rulesOf = (c: Character, scopes: Boundary["scope"][]) =>
+      c.boundaries.filter(
+        (b) =>
+          (b.toolName === tool.name || b.toolName === "*") &&
+          scopes.includes(b.scope ?? "incoming")
+      );
+    const checks: { rule: Boundary; ownerIsActor: boolean }[] = [
+      ...rulesOf(targetChar, ["incoming", "both"]).map((rule) => ({ rule, ownerIsActor: false })),
+      ...rulesOf(actor, ["outgoing", "both"]).map((rule) => ({ rule, ownerIsActor: true })),
+    ];
+    for (const { rule, ownerIsActor } of checks) {
+      const reason = boundaryViolation(rule, input, targetChar, ownerIsActor);
       if (reason === null) continue;
-      const { stateChanges, relationChanges } = applyBoundaryEffects(rule, actor, targetChar);
+      const refuser = ownerIsActor ? actor : targetChar;
+      const { stateChanges, relationChanges } = applyBoundaryEffects(
+        rule,
+        actor,
+        targetChar,
+        refuser
+      );
       const refusal = rule.refusalText.trim() || "твёрдо отстраняется";
       const observation =
-        `${actor.name} пытается: ${tool.title || tool.name} — но ${targetChar.name} ${refusal}`;
-      let result = `${targetChar.name} ${refusal}. Причина: ${reason}. Действие не произошло.`;
+        ownerIsActor
+          ? `${actor.name} останавливается: ${refusal}`
+          : `${actor.name} пытается: ${tool.title || tool.name} — но ${targetChar.name} ${refusal}`;
+      let result = ownerIsActor
+        ? `Твоё собственное правило не пускает: ${refusal}. Причина: ${reason}. Действие не произошло.`
+        : `${targetChar.name} ${refusal}. Причина: ${reason}. Действие не произошло.`;
       if (relationChanges.length > 0) {
-        result += ` | Отношение ${targetChar.name} к тебе изменилось: теперь ${relationChanges[0].value}.`;
+        result += ` | Отношение ${refuser.name} к тебе изменилось: теперь ${relationChanges[0].value}.`;
       }
       if (stateChanges.length > 0) {
-        result += ` | ${stateChanges.map((c) => `${c.key}=${JSON.stringify(c.value)}`).join(", ")}`;
+        result += ` | ${refuser.name}: ${stateChanges.map((c) => `${c.key}=${JSON.stringify(c.value)}`).join(", ")}`;
       }
       result += " Не дави: попробуй разговор, подарок или подожди более подходящего момента.";
       return {
         ok: false,
         result,
         observation,
-        audience: [targetChar.id],
+        audience: "none",
+        targetId: targetChar.id,
         stateChanges,
         relationChanges,
       };
@@ -448,6 +537,27 @@ export function executeTool(input: ToolExecInput): ToolExecResult {
       stateChanges: [],
       relationChanges: [],
     };
+  }
+
+  // Предложение (согласие): тул не исполняется сразу — цель ответит в свой
+  // ход. Границы уже проверены выше: не проходит по характеристикам — даже
+  // предложить нельзя (модель увидела причину). Деньги проверены тоже.
+  if (
+    tool.requiresConsent &&
+    tool.audience === "target" &&
+    targetChar &&
+    targetChar.id !== actor.id &&
+    !input.skipConsent &&
+    input.scene != null
+  ) {
+    return createOfferProposal({
+      tool,
+      actor,
+      target: targetChar,
+      args,
+      sceneId: input.scene.id,
+      turn: input.turn ?? 0,
+    });
   }
 
   // Эффекты: state — через карту состояний (один write на цель),
@@ -551,8 +661,15 @@ export function executeTool(input: ToolExecInput): ToolExecResult {
     result += ` | Исход: «${firedOutcome.title}»`;
   }
   if (stateChanges.length > 0) {
+    // ЧЬЁ состояние изменилось: у адресных тулов эффекты чаще всего ложатся
+    // на цель, а не на актёра — без имени модель читает чужой рост как свой.
+    const nameOf = new Map<number, string>([[actor.id, "ты"]]);
+    if (targetChar) nameOf.set(targetChar.id, targetChar.name);
     result += ` | Изменения состояния: ${stateChanges
-      .map((c) => `${c.key}=${JSON.stringify(c.value)}`)
+      .map(
+        (c) =>
+          `${nameOf.get(c.characterId) ?? `#${c.characterId}`}: ${c.key}=${JSON.stringify(c.value)}`
+      )
       .join(", ")}`;
   }
   for (const up of skillUps) {
@@ -566,6 +683,7 @@ export function executeTool(input: ToolExecInput): ToolExecResult {
     stateChanges,
     relationChanges,
     skillUps,
+    targetId: targetChar?.id,
     outcome: firedOutcome
       ? {
           outcomeId: firedOutcome.id,

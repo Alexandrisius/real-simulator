@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { Plus, Shirt, SlidersHorizontal, Trash2,
   MapPin,
 } from "lucide-react";
@@ -17,7 +17,7 @@ import {
   Select,
 } from "@/components/ui";
 import { api, apiDelete, apiPatch, apiPost } from "@/components/api";
-import type { AttributeDef, ClothingSlot, Place } from "@/lib/types";
+import type { AttributeDef, ClothingSlot, Place, ToolEffect } from "@/lib/types";
 
 interface FormState {
   key: string;
@@ -69,11 +69,18 @@ function attrToForm(a: AttributeDef): FormState {
 interface SlotFormState {
   slot: string;
   layer: number;
-  undressPlaces: string;
+  undressPlaces: string[];
+  bareEffects: ToolEffect[];
   position: number;
 }
 
-const emptySlotForm: SlotFormState = { slot: "", layer: 1, undressPlaces: "", position: 10 };
+const emptySlotForm: SlotFormState = {
+  slot: "",
+  layer: 1,
+  undressPlaces: [],
+  bareEffects: [],
+  position: 10,
+};
 
 export default function AttributesPage() {
   const [attrs, setAttrs] = useState<AttributeDef[]>([]);
@@ -89,6 +96,11 @@ export default function AttributesPage() {
   const [slotEditing, setSlotEditing] = useState<string | null>(null);
   const [slotOpen, setSlotOpen] = useState(false);
   const [slotSaving, setSlotSaving] = useState(false);
+  // Рефы карточек форм: «Изменить» открывает форму наверху страницы —
+  // прокручиваем к ней, чтобы не искать глазами.
+  const attrFormRef = useRef<HTMLDivElement>(null);
+  const slotFormRef = useRef<HTMLDivElement>(null);
+  const [placeEditing, setPlaceEditing] = useState<string | null>(null);
 
   const load = useCallback(() => {
     api<AttributeDef[]>("/api/attributes").then(setAttrs).catch((e) => setError(e.message));
@@ -96,6 +108,16 @@ export default function AttributesPage() {
     api<Place[]>("/api/places").then(setPlaces).catch(() => {});
   }, []);
   useEffect(load, [load]);
+
+  // Селект ключей характеристик с fallback «(нет в реестре)» для чужих значений
+  const attrKeyOptions = attrs.map((a) => ({
+    value: a.key,
+    label: `${a.emoji ? a.emoji + " " : ""}${a.label} (${a.key})`,
+  }));
+  const keyOptions = (cur: string) =>
+    !cur || attrKeyOptions.some((o) => o.value === cur)
+      ? attrKeyOptions
+      : [{ value: cur, label: `${cur} (нет в реестре)` }, ...attrKeyOptions];
 
   const startCreate = () => {
     setForm(emptyForm);
@@ -107,6 +129,9 @@ export default function AttributesPage() {
     setForm(attrToForm(a));
     setEditingId(a.id);
     setOpen(true);
+    requestAnimationFrame(() =>
+      attrFormRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+    );
   };
 
   const save = async () => {
@@ -166,7 +191,11 @@ export default function AttributesPage() {
     const body = {
       slot: slotForm.slot.trim(),
       layer: slotForm.layer,
-      undressPlaces: slotForm.undressPlaces.split(",").map((s) => s.trim().toLowerCase()).filter(Boolean),
+      // оставляем только живые названия мест из реестра
+      undressPlaces: slotForm.undressPlaces.filter((name) =>
+        places.some((p) => p.name === name)
+      ),
+      bareEffects: slotForm.bareEffects,
       position: slotForm.position,
     };
     if (!body.slot) {
@@ -186,6 +215,37 @@ export default function AttributesPage() {
     }
   };
 
+  const startSlotEdit = (s: ClothingSlot) => {
+    setSlotForm({
+      slot: s.slot,
+      layer: s.layer,
+      undressPlaces: [...s.undressPlaces],
+      bareEffects: s.bareEffects.map((e) => ({ ...e })),
+      position: s.position,
+    });
+    setSlotEditing(s.slot);
+    setSlotOpen(true);
+    requestAnimationFrame(() =>
+      slotFormRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+    );
+  };
+
+  /** Выбрать/снять место, где слот можно обнажить */
+  const toggleSlotPlace = (name: string) =>
+    setSlotForm((f) => ({
+      ...f,
+      undressPlaces: f.undressPlaces.includes(name)
+        ? f.undressPlaces.filter((x) => x !== name)
+        : [...f.undressPlaces, name],
+    }));
+
+  const setSlotEffect = (i: number, patch: Partial<ToolEffect>) => {
+    setSlotForm((f) => ({
+      ...f,
+      bareEffects: f.bareEffects.map((e, j) => (i === j ? { ...e, ...patch } : e)),
+    }));
+  };
+
   const removeSlot = async (s: ClothingSlot) => {
     if (!confirm(`Удалить слот «${s.slot}»? Надетые предметы останутся в state персонажей (worn_${s.slot}).`))
       return;
@@ -198,6 +258,17 @@ export default function AttributesPage() {
     }
   };
   const [placeForm, setPlaceForm] = useState({ name: "", description: "" });
+
+  const startPlaceEdit = (pl: Place) => {
+    setPlaceEditing(pl.name);
+    setPlaceForm({ name: pl.name, description: pl.description });
+  };
+
+  const cancelPlaceEdit = () => {
+    setPlaceEditing(null);
+    setPlaceForm({ name: "", description: "" });
+  };
+
   const savePlace = async () => {
     setError("");
     if (!placeForm.name.trim()) {
@@ -205,11 +276,23 @@ export default function AttributesPage() {
       return;
     }
     try {
-      await apiPost("/api/places", {
-        name: placeForm.name.trim(),
-        description: placeForm.description.trim(),
-        position: places.length + 1,
-      });
+      if (placeEditing) {
+        // Позицию передаём явно: zod по умолчанию подставил бы 0
+        const position =
+          places.find((p) => p.name === placeEditing)?.position ?? places.length + 1;
+        await apiPatch(`/api/places/${encodeURIComponent(placeEditing)}`, {
+          name: placeForm.name.trim(),
+          description: placeForm.description.trim(),
+          position,
+        });
+        setPlaceEditing(null);
+      } else {
+        await apiPost("/api/places", {
+          name: placeForm.name.trim(),
+          description: placeForm.description.trim(),
+          position: places.length + 1,
+        });
+      }
       setPlaceForm({ name: "", description: "" });
       load();
     } catch (e) {
@@ -241,6 +324,7 @@ export default function AttributesPage() {
       <ErrorText>{error}</ErrorText>
 
       {open && (
+        <div ref={attrFormRef}>
         <Card className="mb-6 p-5">
           <div className="mb-4 text-sm font-medium">
             {editingId ? `Редактирование: ${form.label}` : "Новая характеристика"}
@@ -382,6 +466,7 @@ export default function AttributesPage() {
             </Btn>
           </div>
         </Card>
+        </div>
       )}
 
       {attrs.length === 0 ? (
@@ -457,6 +542,7 @@ export default function AttributesPage() {
       </div>
 
       {slotOpen && (
+        <div ref={slotFormRef}>
         <Card className="mt-4 p-5">
           <div className="mb-4 text-sm font-medium">
             {slotEditing ? `Редактирование слота: ${slotEditing}` : "Новый слот"}
@@ -481,17 +567,102 @@ export default function AttributesPage() {
               />
             </Field>
             <Field
-              label="Где можно снять (через запятую)"
+              label="Где можно снять"
               className="sm:col-span-2"
-              hint="места сцены: дом, отель, пляж… Пусто — где угодно"
+              hint="места из реестра ниже; ничего не выбрано — снимать можно где угодно"
             >
-              <Input
-                value={slotForm.undressPlaces}
-                onChange={(e) => setSlotForm({ ...slotForm, undressPlaces: e.target.value })}
-                placeholder="дом, отель, пляж"
-              />
+              {places.length === 0 ? (
+                <p className="text-xs text-muted/70">
+                  В реестре мест пока пусто — слот можно снять где угодно.
+                </p>
+              ) : (
+                <div className="flex flex-wrap gap-3">
+                  {places.map((pl) => (
+                    <label key={pl.name} className="flex cursor-pointer items-center gap-1.5 text-sm">
+                      <input
+                        type="checkbox"
+                        checked={slotForm.undressPlaces.includes(pl.name)}
+                        onChange={() => toggleSlotPlace(pl.name)}
+                        className="h-4 w-4 accent-[var(--color-accent)]"
+                      />
+                      <span className="text-muted">{pl.name}</span>
+                    </label>
+                  ))}
+                </div>
+              )}
             </Field>
           </div>
+
+          <div className="mt-4">
+            <div className="mb-2 flex items-center justify-between">
+              <span className="text-xs font-medium uppercase tracking-wide text-muted">
+                Эффекты, пока слот пуст (bareEffects)
+              </span>
+              <Btn
+                variant="ghost"
+                className="h-7 px-2 text-xs"
+                onClick={() =>
+                  setSlotForm((f) => ({
+                    ...f,
+                    bareEffects: [
+                      ...f.bareEffects,
+                      { target: "self", key: attrs[0]?.key ?? "mood", op: "add", value: 1 },
+                    ],
+                  }))
+                }
+              >
+                <Plus className="h-3 w-3" /> эффект
+              </Btn>
+            </div>
+            {slotForm.bareEffects.length === 0 && (
+              <p className="text-xs leading-relaxed text-muted/70">
+                Необязательно. Действуют на носителя, пока слот не надет (нет белья — лёгкое
+                беспокойство); надевание гасит эффект, снятие возвращает.
+              </p>
+            )}
+            {slotForm.bareEffects.map((e, i) => (
+              <div key={i} className="mb-2 flex flex-wrap items-center gap-2">
+                <div className="min-w-44 flex-1">
+                  <Select
+                    value={e.key}
+                    onChange={(v) => setSlotEffect(i, { key: v })}
+                    options={keyOptions(e.key)}
+                  />
+                </div>
+                <Select
+                  value={e.op}
+                  onChange={(v) => setSlotEffect(i, { op: v as ToolEffect["op"] })}
+                  className="w-20 shrink-0"
+                  options={[
+                    { value: "add", label: "+=" },
+                    { value: "set", label: "=" },
+                  ]}
+                />
+                <div className="w-24 shrink-0">
+                  <Input
+                    value={String(e.value)}
+                    onChange={(ev) => {
+                      const v = ev.target.value;
+                      const num = Number(v);
+                      setSlotEffect(i, { value: v !== "" && !Number.isNaN(num) ? num : v });
+                    }}
+                    placeholder="1"
+                  />
+                </div>
+                <IconBtn
+                  variant="danger"
+                  size="sm"
+                  label="Удалить эффект"
+                  onClick={() =>
+                    setSlotForm((f) => ({ ...f, bareEffects: f.bareEffects.filter((_, j) => j !== i) }))
+                  }
+                >
+                  <Trash2 className="h-4 w-4" />
+                </IconBtn>
+              </div>
+            ))}
+          </div>
+
           <div className="mt-5 flex gap-2">
             <Btn variant="primary" onClick={saveSlot} loading={slotSaving}>
               Сохранить
@@ -501,6 +672,7 @@ export default function AttributesPage() {
             </Btn>
           </div>
         </Card>
+        </div>
       )}
 
       {slots.length > 0 && (
@@ -516,21 +688,17 @@ export default function AttributesPage() {
                 <div className="mt-0.5 truncate text-xs text-muted">
                   {s.undressPlaces.length === 0 ? "снять можно где угодно" : `обнажать: ${s.undressPlaces.join(", ")}`}
                 </div>
+                {s.bareEffects.length > 0 && (
+                  <div className="mt-0.5 truncate text-xs text-muted/80">
+                    пока пусто:{" "}
+                    {s.bareEffects
+                      .map((e) => `${e.key} ${e.op === "add" ? "+=" : "="} ${JSON.stringify(e.value)}`)
+                      .join(", ")}
+                  </div>
+                )}
               </div>
               <div className="flex shrink-0 gap-1">
-                <IconBtn
-                  label="Редактировать"
-                  onClick={() => {
-                    setSlotForm({
-                      slot: s.slot,
-                      layer: s.layer,
-                      undressPlaces: s.undressPlaces.join(", "),
-                      position: s.position,
-                    });
-                    setSlotEditing(s.slot);
-                    setSlotOpen(true);
-                  }}
-                >
+                <IconBtn label="Редактировать" onClick={() => startSlotEdit(s)}>
                   ✎
                 </IconBtn>
                 <IconBtn variant="danger" label="Удалить" onClick={() => removeSlot(s)}>
@@ -557,17 +725,32 @@ export default function AttributesPage() {
           <Input
             value={placeForm.name}
             onChange={(e) => setPlaceForm((f) => ({ ...f, name: e.target.value }))}
-            placeholder="название (отель)"
+            placeholder={placeEditing ? "новое название" : "название (отель)"}
           />
           <Input
             value={placeForm.description}
             onChange={(e) => setPlaceForm((f) => ({ ...f, description: e.target.value }))}
             placeholder="описание для агентов (необязательно)"
           />
-          <Btn onClick={savePlace}>
-            <Plus className="h-4 w-4" /> Добавить
-          </Btn>
+          {placeEditing ? (
+            <div className="flex gap-2">
+              <Btn onClick={savePlace}>Сохранить</Btn>
+              <Btn variant="ghost" onClick={cancelPlaceEdit}>
+                Отмена
+              </Btn>
+            </div>
+          ) : (
+            <Btn onClick={savePlace}>
+              <Plus className="h-4 w-4" /> Добавить
+            </Btn>
+          )}
         </div>
+        {placeEditing && (
+          <p className="mb-3 text-xs leading-relaxed text-warn/90">
+            Редактируется «{placeEditing}». Переименование обновит все ссылки: сцены, границы,
+            слоты одежды, условия исходов.
+          </p>
+        )}
         {places.length === 0 ? (
           <p className="text-xs text-muted/70">Мест пока нет — добавьте хотя бы одно.</p>
         ) : (
@@ -581,6 +764,13 @@ export default function AttributesPage() {
                 <span className="min-w-0 flex-1 truncate text-xs text-muted">
                   {pl.description}
                 </span>
+                <IconBtn
+                  size="sm"
+                  label={`Редактировать ${pl.name}`}
+                  onClick={() => startPlaceEdit(pl)}
+                >
+                  ✎
+                </IconBtn>
                 <IconBtn
                   variant="danger"
                   size="sm"

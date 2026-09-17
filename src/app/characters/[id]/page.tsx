@@ -2,7 +2,7 @@
 
 import { use, useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, Plus, RefreshCw, Shield, Trash2 } from "lucide-react";
+import { ArrowLeft, Plus, RefreshCw, Shield, Shirt, Trash2 } from "lucide-react";
 import {
   Badge,
   Btn,
@@ -17,7 +17,17 @@ import {
 } from "@/components/ui";
 import { api, apiDelete, apiPatch, apiPost } from "@/components/api";
 import { Combobox } from "@/components/Combobox";
-import type { AttributeDef, Boundary, Character, Provider, Tool } from "@/lib/types";
+import type {
+  AttributeDef,
+  Character,
+  ClothingSlot,
+  Garment,
+  Place,
+  Provider,
+  Tool,
+  ToolEffect,
+} from "@/lib/types";
+import { CARRIED_PREFIX, WORN_PREFIX } from "@/lib/types";
 
 const EMOJIS = [
   "👩","👨","🧑","👧","👦","👵","👴","🧓","🦊","🐱","🐺","🦉","🌸","🔥","🌙","⭐",
@@ -36,13 +46,15 @@ interface FormState {
   persona: string;
   providerId: number | null;
   model: string;
+  fallbackProviderId: number | null;
+  fallbackModel: string;
   temperature: number;
   maxTokens: number;
   toolIds: number[];
   stateText: string;
   isHuman: boolean;
   income: number;
-  boundaries: Boundary[];
+  boundaries: FormBoundary[];
 }
 
 const emptyForm: FormState = {
@@ -51,6 +63,8 @@ const emptyForm: FormState = {
   persona: "",
   providerId: null,
   model: "",
+  fallbackProviderId: null,
+  fallbackModel: "",
   temperature: 0.8,
   maxTokens: 1024,
   toolIds: [],
@@ -59,6 +73,264 @@ const emptyForm: FormState = {
   income: 0,
   boundaries: [],
 };
+
+/** Слот гардероба: что надето прямо сейчас. */
+interface WardrobeSlotView {
+  slot: string;
+  worn: string | null;
+  garmentId: number | null;
+}
+
+/** Ответ /wardrobe: что лежит в гардеробе и что надето по слотам. */
+interface WardrobeView {
+  owned: Garment[];
+  slots: WardrobeSlotView[];
+}
+
+// ---- Границы: блочный конструктор «когда → условия → отказ» ----
+
+/** Условие срабатывания границы (новый формат бэкенда). */
+type BoundaryCondition =
+  | { kind: "relation"; op: ">=" | "<" | "="; value: number }
+  | { kind: "attr"; owner: "actor" | "target"; key: string; op: ">=" | "<" | "="; value: number }
+  | { kind: "place"; place: string }
+  | { kind: "worn"; slot: string; bare: boolean };
+
+/** Граница в форме: инструмент + область действия + условия («И») + текст и последствия отказа. */
+interface FormBoundary {
+  toolName: string;
+  scope: "incoming" | "outgoing" | "both";
+  conditions: BoundaryCondition[];
+  refusalText: string;
+  effects: ToolEffect[];
+}
+
+/** Запись с сервера: новый формат (conditions) или легаси-поля старого бэкенда. */
+interface RawBoundary {
+  toolName?: string;
+  scope?: "incoming" | "outgoing" | "both";
+  conditions?: BoundaryCondition[];
+  refusalText?: string;
+  effects?: ToolEffect[];
+  minRelation?: number | null;
+  minAttr?: { key: string; value: number } | null;
+  /** @deprecated самый старый порог настроения (ещё до minAttr) */
+  minMood?: number | null;
+  requirePlace?: string | null;
+  requireAttr?: {
+    owner: "actor" | "target";
+    key: string;
+    op: ">=" | "=";
+    value: number;
+  } | null;
+}
+
+/** Легаси-поля → условия нового формата: старые записи не теряются. */
+function legacyToConditions(b: RawBoundary): BoundaryCondition[] {
+  const out: BoundaryCondition[] = [];
+  if (typeof b.minRelation === "number")
+    out.push({ kind: "relation", op: ">=", value: b.minRelation });
+  if (b.minAttr && typeof b.minAttr.value === "number")
+    out.push({ kind: "attr", owner: "target", key: b.minAttr.key, op: ">=", value: b.minAttr.value });
+  else if (typeof b.minMood === "number")
+    out.push({ kind: "attr", owner: "target", key: "mood", op: ">=", value: b.minMood });
+  if (b.requirePlace) out.push({ kind: "place", place: b.requirePlace });
+  if (b.requireAttr && typeof b.requireAttr.value === "number")
+    out.push({
+      kind: "attr",
+      owner: b.requireAttr.owner,
+      key: b.requireAttr.key,
+      op: b.requireAttr.op,
+      value: b.requireAttr.value,
+    });
+  return out;
+}
+
+/** Граница с сервера → форма: новый формат; нет условий — защитный разбор легаси. */
+function toFormBoundary(raw: RawBoundary): FormBoundary {
+  return {
+    toolName: raw.toolName ?? "*",
+    scope: raw.scope ?? "incoming",
+    conditions:
+      Array.isArray(raw.conditions) && raw.conditions.length > 0
+        ? raw.conditions
+        : legacyToConditions(raw),
+    refusalText: raw.refusalText ?? "",
+    effects: Array.isArray(raw.effects) ? raw.effects : [],
+  };
+}
+
+/** Правило по умолчанию: любое адресное действие при отношении ≥ 3. */
+const defaultBoundary = (): FormBoundary => ({
+  toolName: "*",
+  scope: "incoming",
+  conditions: [{ kind: "relation", op: ">=", value: 3 }],
+  refusalText: "мягко уклоняется: слишком рано",
+  effects: [],
+});
+
+const OP_OPTIONS = [
+  { value: ">=", label: "≥" },
+  { value: "<", label: "<" },
+  { value: "=", label: "=" },
+];
+
+/** Вид условия; attr различается владельцем — два отдельных пункта. */
+const CONDITION_KIND_OPTIONS = [
+  { value: "relation", label: "отношение" },
+  { value: "attr:actor", label: "характеристика того, кто действует" },
+  { value: "attr:target", label: "характеристика того, на кого действуют" },
+  { value: "place", label: "место" },
+  { value: "worn", label: "слот одежды" },
+];
+
+/** Строка условия: первый Select — вид условия, дальше поля по виду. */
+function ConditionRow({
+  cond,
+  onChange,
+  onRemove,
+  attributes,
+  places,
+  slots,
+}: {
+  cond: BoundaryCondition;
+  onChange: (next: BoundaryCondition) => void;
+  onRemove: () => void;
+  attributes: AttributeDef[];
+  places: Place[];
+  slots: ClothingSlot[];
+}) {
+  const kindValue = cond.kind === "attr" ? `attr:${cond.owner}` : cond.kind;
+  const setKind = (v: string) => {
+    if (v === "relation") onChange({ kind: "relation", op: ">=", value: 3 });
+    else if (v === "attr:actor" || v === "attr:target")
+      onChange({
+        kind: "attr",
+        owner: v === "attr:actor" ? "actor" : "target",
+        key: attributes[0]?.key ?? "mood",
+        op: ">=",
+        value: 0,
+      });
+    else if (v === "place") onChange({ kind: "place", place: places[0]?.name ?? "" });
+    else onChange({ kind: "worn", slot: slots[0]?.slot ?? "", bare: true });
+  };
+  // Варианты ключей из реестра; фактическое значение могло из реестра удалиться.
+  const attrOptions = attributes.map((a) => ({
+    value: a.key,
+    label: `${a.emoji ? a.emoji + " " : ""}${a.label}`,
+  }));
+  const attrKeyOptions =
+    cond.kind === "attr" && !attrOptions.some((o) => o.value === cond.key)
+      ? [{ value: cond.key, label: `${cond.key} (нет в реестре)` }, ...attrOptions]
+      : attrOptions;
+  const placeOptions = places.map((p) => ({ value: p.name, label: p.name }));
+  if (cond.kind === "place" && cond.place && !places.some((p) => p.name === cond.place))
+    placeOptions.unshift({ value: cond.place, label: `${cond.place} (нет в реестре)` });
+  const slotOptions = slots.map((s) => ({ value: s.slot, label: s.slot }));
+  if (cond.kind === "worn" && cond.slot && !slots.some((s) => s.slot === cond.slot))
+    slotOptions.unshift({ value: cond.slot, label: `${cond.slot} (нет в реестре)` });
+
+  // Числовое условие (relation/attr): оператор и порог пересобираем явно.
+  const setOp = (v: string) => {
+    const op = v as ">=" | "<" | "=";
+    if (cond.kind === "relation") onChange({ kind: "relation", op, value: cond.value });
+    else if (cond.kind === "attr")
+      onChange({ kind: "attr", owner: cond.owner, key: cond.key, op, value: cond.value });
+  };
+  const setValue = (n: number) => {
+    if (cond.kind === "relation") onChange({ kind: "relation", op: cond.op, value: n });
+    else if (cond.kind === "attr")
+      onChange({ kind: "attr", owner: cond.owner, key: cond.key, op: cond.op, value: n });
+  };
+  const opSelect =
+    cond.kind === "relation" || cond.kind === "attr" ? (
+      <Select
+        value={cond.op}
+        onChange={setOp}
+        className="w-16 shrink-0"
+        options={OP_OPTIONS}
+      />
+    ) : null;
+  const numInput =
+    cond.kind === "relation" || cond.kind === "attr" ? (
+      <Input
+        type="number"
+        value={cond.value}
+        onChange={(e) => setValue(Number(e.target.value))}
+        className="w-20 shrink-0"
+      />
+    ) : null;
+
+  return (
+    <div className="flex flex-wrap items-center gap-2 rounded-lg border border-line bg-panel-2/40 px-2.5 py-2">
+      <Select
+        value={kindValue}
+        onChange={setKind}
+        className="min-w-44 flex-1"
+        options={CONDITION_KIND_OPTIONS}
+      />
+      {cond.kind === "relation" && (
+        <>
+          {opSelect}
+          {numInput}
+        </>
+      )}
+      {cond.kind === "attr" && (
+        <>
+          <div className="min-w-40 flex-1">
+            <Select
+              value={cond.key}
+              onChange={(v) =>
+                onChange({
+                  kind: "attr",
+                  owner: cond.owner,
+                  key: v,
+                  op: cond.op,
+                  value: cond.value,
+                })
+              }
+              options={attrKeyOptions}
+            />
+          </div>
+          {opSelect}
+          {numInput}
+        </>
+      )}
+      {cond.kind === "place" && (
+        <div className="min-w-40 flex-1">
+          <Select
+            value={cond.place}
+            onChange={(v) => onChange({ kind: "place", place: v })}
+            options={placeOptions}
+          />
+        </div>
+      )}
+      {cond.kind === "worn" && (
+        <>
+          <div className="min-w-40 flex-1">
+            <Select
+              value={cond.slot}
+              onChange={(v) => onChange({ kind: "worn", slot: v, bare: cond.bare })}
+              options={slotOptions}
+            />
+          </div>
+          <Select
+            value={cond.bare ? "bare" : "worn"}
+            onChange={(v) => onChange({ kind: "worn", slot: cond.slot, bare: v === "bare" })}
+            className="min-w-40 flex-1"
+            options={[
+              { value: "bare", label: "должен быть пуст" },
+              { value: "worn", label: "занят" },
+            ]}
+          />
+        </>
+      )}
+      <IconBtn variant="danger" label="Удалить условие" onClick={onRemove}>
+        <Trash2 className="h-3.5 w-3.5" />
+      </IconBtn>
+    </div>
+  );
+}
 
 export default function CharacterEditorPage({
   params,
@@ -76,12 +348,19 @@ export default function CharacterEditorPage({
   const [attributes, setAttributes] = useState<AttributeDef[]>([]);
   const [others, setOthers] = useState<Character[]>([]);
   const [chem, setChem] = useState<{ aId: number; bId: number; value: number }[]>([]);
+  const [places, setPlaces] = useState<Place[]>([]);
+  const [clothingSlots, setClothingSlots] = useState<ClothingSlot[]>([]);
   const [models, setModels] = useState<string[]>([]);
   const [modelsError, setModelsError] = useState("");
   const [loadingModels, setLoadingModels] = useState(false);
+  const [fbModels, setFbModels] = useState<string[]>([]);
+  const [fbModelsError, setFbModelsError] = useState("");
+  const [loadingFbModels, setLoadingFbModels] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [loaded, setLoaded] = useState(false);
+  const [wardrobe, setWardrobe] = useState<WardrobeView>({ owned: [], slots: [] });
+  const [wardrobeBusy, setWardrobeBusy] = useState(false);
 
   const loadMeta = useCallback(() => {
     Promise.all([
@@ -90,12 +369,16 @@ export default function CharacterEditorPage({
       api<AttributeDef[]>("/api/attributes"),
       api<Character[]>("/api/characters").catch(() => [] as Character[]),
       api<{ aId: number; bId: number; value: number }[]>("/api/chemistry").catch(() => []),
+      api<Place[]>("/api/places").catch(() => [] as Place[]),
+      api<ClothingSlot[]>("/api/clothing-slots").catch(() => [] as ClothingSlot[]),
     ])
-      .then(([p, t, a, ch, cm]) => {
+      .then(([p, t, a, ch, cm, pl, cs]) => {
         setProviders(p);
         setTools(t);
         setAttributes(a);
         setChem(cm);
+        setPlaces(pl);
+        setClothingSlots(cs);
         if (!isNew) setOthers(ch.filter((c) => c.id !== numericId));
       })
       .catch((e) => setError(e.message));
@@ -115,17 +398,24 @@ export default function CharacterEditorPage({
           persona: c.persona,
           providerId: c.providerId,
           model: c.model,
+          fallbackProviderId: c.fallbackProviderId ?? null,
+          fallbackModel: c.fallbackModel ?? "",
           temperature: c.temperature,
           maxTokens: c.maxTokens,
           toolIds: c.toolIds,
           stateText: JSON.stringify(c.state, null, 2),
           isHuman: c.isHuman,
           income: c.income ?? 0,
-          boundaries: c.boundaries ?? [],
+          // Новый формат (conditions) или защитный разбор легаси-полей старого сервера.
+          boundaries: ((c.boundaries ?? []) as unknown as RawBoundary[]).map(toFormBoundary),
         });
         setLoaded(true);
       })
       .catch((e) => setError(e.message));
+    // Гардероб: сбой не блокирует редактор.
+    api<WardrobeView>(`/api/characters/${numericId}/wardrobe`)
+      .then(setWardrobe)
+      .catch(() => {});
   }, [isNew, numericId, loadMeta]);
 
   const loadModels = useCallback(
@@ -153,6 +443,50 @@ export default function CharacterEditorPage({
     else setModels([]);
   }, [form.providerId, loadModels]);
 
+  // Модели страховочного провайдера — отдельный список под свою пару полей.
+  const loadFbModels = useCallback(async (providerId: number) => {
+    setLoadingFbModels(true);
+    setFbModelsError("");
+    try {
+      const r = await api<{ models: string[] }>(`/api/providers/${providerId}/models`);
+      setFbModels(r.models);
+      if (r.models.length === 0) setFbModelsError("Список пуст — введите имя модели вручную");
+    } catch (e) {
+      setFbModels([]);
+      setFbModelsError(
+        `${e instanceof Error ? e.message : String(e)} — можно ввести имя модели вручную`
+      );
+    } finally {
+      setLoadingFbModels(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (form.fallbackProviderId) loadFbModels(form.fallbackProviderId);
+    else {
+      setFbModels([]);
+      setFbModelsError("");
+    }
+  }, [form.fallbackProviderId, loadFbModels]);
+
+  // Гардероб: надеть/снять. Сервер при «надеть» сам выдаёт владение предметом
+  // и возвращает свежий вид гардероба — он же и переполучение после мутации.
+  const applyWardrobe = async (garmentId: number, action: "wear" | "remove") => {
+    setError("");
+    setWardrobeBusy(true);
+    try {
+      const r = await apiPost<WardrobeView>(`/api/characters/${numericId}/wardrobe`, {
+        garmentId,
+        action,
+      });
+      setWardrobe(r);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setWardrobeBusy(false);
+    }
+  };
+
   const toggleTool = (tid: number) =>
     setForm((f) => ({
       ...f,
@@ -174,15 +508,17 @@ export default function CharacterEditorPage({
   const setAttrValue = (key: string, raw: string, type: AttributeDef["type"]) => {
     if (!stateObj) return; // невалидный JSON в ручном редакторе — не трогаем
     const next = { ...stateObj };
+    // Пустое поле = null: сервер при PATCH удаляет ключ (state мёржится по
+    // ключам, простое отсутствие ключа ничего бы не изменило).
     if (type === "number") {
-      if (raw === "") delete next[key];
+      if (raw === "") next[key] = null;
       else {
         const n = Number(raw);
         if (Number.isNaN(n)) return;
         next[key] = n;
       }
     } else if (raw === "") {
-      delete next[key];
+      next[key] = null;
     } else {
       next[key] = raw;
     }
@@ -190,9 +526,13 @@ export default function CharacterEditorPage({
   };
 
   const knownKeys = new Set(attributes.map((a) => a.key));
+  // worn_*/carried_* — ключи одежды: ими управляет гардероб, в форме их не правим.
+  const isWardrobeKey = (k: string) =>
+    k.startsWith(WORN_PREFIX) || k.startsWith(CARRIED_PREFIX);
   const extraKeys = stateObj
-    ? Object.keys(stateObj).filter((k) => !knownKeys.has(k))
+    ? Object.keys(stateObj).filter((k) => !knownKeys.has(k) && !isWardrobeKey(k))
     : [];
+  const hasWardrobeKeys = stateObj ? Object.keys(stateObj).some(isWardrobeKey) : false;
   // Навыки — характеристики с ключом skill_*: отдельная группа, уровень скрыт.
   const skillAttrs = attributes.filter((a) => a.key.startsWith("skill_"));
   const plainAttrs = attributes.filter((a) => !a.key.startsWith("skill_"));
@@ -216,6 +556,8 @@ export default function CharacterEditorPage({
       persona: form.persona,
       providerId: form.isHuman ? null : form.providerId,
       model: form.isHuman ? "" : form.model,
+      fallbackProviderId: form.isHuman ? null : form.fallbackProviderId,
+      fallbackModel: form.isHuman ? "" : form.fallbackModel,
       temperature: form.temperature,
       maxTokens: form.maxTokens,
       toolIds: form.toolIds,
@@ -254,6 +596,16 @@ export default function CharacterEditorPage({
     () => providers.find((p) => p.id === form.providerId),
     [providers, form.providerId]
   );
+  const selectedFallbackProvider = useMemo(
+    () => providers.find((p) => p.id === form.fallbackProviderId),
+    [providers, form.fallbackProviderId]
+  );
+
+  // «В шкафу»: выданные, но сейчас не надетые предметы со слотом (их можно надеть).
+  const closetGarments = useMemo(() => {
+    const wornIds = new Set(wardrobe.slots.map((s) => s.garmentId));
+    return wardrobe.owned.filter((g) => g.slot && !wornIds.has(g.id));
+  }, [wardrobe]);
 
   if (!loaded) {
     return (
@@ -417,6 +769,67 @@ export default function CharacterEditorPage({
             />
           </Field>
         </div>
+
+        <div className="mt-4 border-t border-line pt-4">
+          <div className="mb-2 flex flex-wrap items-center gap-2">
+            <span className="text-sm font-medium">Страховочная модель</span>
+            <Badge color="warn">подхватывает ход, когда основная отказывается</Badge>
+          </div>
+          <p className="mb-3 text-xs leading-relaxed text-muted">
+            Если основная модель отвечает отказом («я не могу…»), её генерация обрывается
+            фильтром (пустой ответ, content_filter) или API блокирует запрос — этот же ход
+            молча выполняет страховочная модель. Отказ в сцену не попадает: другие персонажи
+            его не видят, а следующий ход снова делает основная модель. Ставьте сюда
+            безотказную модель (Grok, локальный Qwen без цензуры в LM Studio…).
+          </p>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="Провайдер (страховка)">
+              <Select
+                value={form.fallbackProviderId != null ? String(form.fallbackProviderId) : ""}
+                onChange={(v) =>
+                  setForm({
+                    ...form,
+                    fallbackProviderId: v ? Number(v) : null,
+                    fallbackModel: "",
+                  })
+                }
+                options={[
+                  { value: "", label: "— нет (отказы видны как мысли) —" },
+                  ...providers.map((p) => ({ value: String(p.id), label: p.name })),
+                ]}
+              />
+            </Field>
+            <Field
+              label="Модель (страховка)"
+              hint={
+                fbModelsError ||
+                (selectedFallbackProvider?.kind === "mock"
+                  ? "Для mock подойдёт любое имя"
+                  : "Выберите из списка или введите вручную")
+              }
+            >
+              <div className="flex gap-2">
+                <Combobox
+                  value={form.fallbackModel}
+                  onChange={(m) => setForm({ ...form, fallbackModel: m })}
+                  options={fbModels}
+                  placeholder="xai/grok-4.2 / qwen2.5-72b-instruct"
+                  className="min-w-0 flex-1"
+                  inputClassName="font-mono text-xs"
+                />
+                <IconBtn
+                  label="Обновить список моделей страховки"
+                  loading={loadingFbModels}
+                  onClick={() =>
+                    form.fallbackProviderId && loadFbModels(form.fallbackProviderId)
+                  }
+                >
+                  {!loadingFbModels && <RefreshCw className="h-[18px] w-[18px]" />}
+                </IconBtn>
+              </div>
+            </Field>
+          </div>
+        </div>
       </Card>
       )}
 
@@ -473,15 +886,15 @@ export default function CharacterEditorPage({
           <Badge color="warn">агент о них не знает — узнаёт, столкнувшись</Badge>
         </div>
         <p className="mb-3 text-xs leading-relaxed text-muted">
-          Правила на адресные действия против этого персонажа. Условия проверяются движком
-          до денег и эффектов: не выполнено — отказ (действие не происходит, деньги целы),
-          а попытку владелец границы видит автоматически. Последствия отказа бьют по
-          отношению владельца к актёру и по его же настроению — актёра система не трогает.
+          Правила на адресные действия: условие не выполнено — отказ (действие не происходит,
+          деньги целы), попытку и причину видит только инициатор. «Когда другие действуют на меня»
+          — классическое согласие; «когда я действую на других» — личные принципы («не сплю с
+          теми, у кого X ниже порога»). Последствия отказа бьют только по владельцу правила.
         </p>
 
         <div className="flex flex-col gap-3">
           {form.boundaries.map((b, bi) => {
-            const setB = (patch: Partial<Boundary>) =>
+            const setB = (patch: Partial<FormBoundary>) =>
               setForm((f) => ({
                 ...f,
                 boundaries: f.boundaries.map((x, i) => (i === bi ? { ...x, ...patch } : x)),
@@ -489,7 +902,21 @@ export default function CharacterEditorPage({
             const addressedTools = tools.filter((t) => t.audience === "target");
             return (
               <div key={bi} className="rounded-lg border border-line bg-panel-2/40 p-3">
-                <div className="flex items-center gap-2">
+                {/* 1/3. Когда срабатывает */}
+                <div className="text-xs font-medium uppercase tracking-wide text-muted">
+                  Когда срабатывает
+                </div>
+                <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                  <Select
+                    value={b.scope}
+                    onChange={(v) => setB({ scope: v as FormBoundary["scope"] })}
+                    className="min-w-56 flex-1"
+                    options={[
+                      { value: "incoming", label: "когда действуют на меня" },
+                      { value: "outgoing", label: "когда я действую на других" },
+                      { value: "both", label: "в обе стороны" },
+                    ]}
+                  />
                   <Select
                     value={b.toolName}
                     onChange={(v) => setB({ toolName: v })}
@@ -509,198 +936,154 @@ export default function CharacterEditorPage({
                     <Trash2 className="h-4 w-4" />
                   </IconBtn>
                 </div>
+                <p className="mt-1 text-xs text-muted/80">
+                  «*» — любой адресный инструмент. В условиях «кто действует» — инициатор вызова,
+                  «на кого действуют» — получатель (для правила «на меня» это сам персонаж).
+                </p>
 
-                <div className="mt-2.5 grid gap-2.5 sm:grid-cols-3">
-                  <Field label="Отношение ≥" hint="отношение этого персонажа к актёру">
-                    <Input
-                      type="number"
-                      value={b.minRelation ?? ""}
-                      onChange={(e) =>
-                        setB({ minRelation: e.target.value === "" ? null : Number(e.target.value) })
-                      }
-                      placeholder="—"
-                      className="max-w-[7.5rem]"
-                    />
-                  </Field>
-                  <Field label="Настроение ≥" hint="ключ mood владельца границы">
-                    <Input
-                      type="number"
-                      value={b.minMood ?? ""}
-                      onChange={(e) =>
-                        setB({ minMood: e.target.value === "" ? null : Number(e.target.value) })
-                      }
-                      placeholder="—"
-                      className="max-w-[7.5rem]"
-                    />
-                  </Field>
-                  <Field label="Только в месте" hint="место сцены: дом, отель…">
-                    <Combobox
-                      value={b.requirePlace ?? ""}
-                      onChange={(v) => setB({ requirePlace: v === "" ? null : v })}
-                      options={["дом", "улица", "кафе", "отель", "пляж"]}
-                      placeholder="— любое —"
-                    />
-                  </Field>
-                </div>
-
-                <div className="mt-2.5 grid gap-2.5 sm:grid-cols-2">
-                  <Field label="Требование к характеристике (физика)" hint="проверяется истинное значение — заявления не считаются">
-                    <div className="flex gap-2">
-                      <Select
-                        value={b.requireAttr ? b.requireAttr.owner : ""}
-                        onChange={(v) =>
-                          setB({
-                            requireAttr:
-                              v === ""
-                                ? null
-                                : {
-                                    owner: v as "actor" | "target",
-                                    key: b.requireAttr?.key ?? attributes[0]?.key ?? "height",
-                                    op: b.requireAttr?.op ?? ">=",
-                                    value: b.requireAttr?.value ?? 0,
-                                  },
-                          })
-                        }
-                        className="w-32"
-                        options={[
-                          { value: "", label: "нет" },
-                          { value: "actor", label: "у актёра" },
-                          { value: "target", label: "у владельца" },
-                        ]}
-                      />
-                      {b.requireAttr && (
-                        <>
-                          <div className="min-w-0 flex-1">
-                            <Select
-                              value={b.requireAttr.key}
-                              onChange={(v) =>
-                                setB({ requireAttr: { ...b.requireAttr!, key: v } })
-                              }
-                              options={attributes.map((a) => ({
-                                value: a.key,
-                                label: `${a.emoji ? a.emoji + " " : ""}${a.label}`,
-                              }))}
-                            />
-                          </div>
-                          <Select
-                            value={b.requireAttr.op}
-                            onChange={(v) =>
-                              setB({ requireAttr: { ...b.requireAttr!, op: v as ">=" | "=" } })
-                            }
-                            className="w-16 shrink-0"
-                            options={[
-                              { value: ">=", label: "≥" },
-                              { value: "=", label: "=" },
-                            ]}
-                          />
-                          <Input
-                            type="number"
-                            value={b.requireAttr.value}
-                            onChange={(e) =>
-                              setB({ requireAttr: { ...b.requireAttr!, value: Number(e.target.value) } })
-                            }
-                            className="w-20 shrink-0"
-                          />
-                        </>
-                      )}
-                    </div>
-                  </Field>
-                  <Field label="Текст отказа (от лица персонажа)">
-                    <Input
-                      value={b.refusalText}
-                      onChange={(e) => setB({ refusalText: e.target.value })}
-                      placeholder="твёрдо отстраняется: слишком рано"
-                    />
-                  </Field>
-                </div>
-
-                <div className="mt-2">
-                  <div className="mb-1 flex items-center justify-between">
-                    <span className="text-xs font-medium uppercase tracking-wide text-muted">
-                      Последствия отказа
-                    </span>
-                    <Btn
-                      variant="ghost"
-                      className="h-6 px-2 text-[11px]"
-                      onClick={() =>
-                        setB({
-                          effects: [
-                            ...b.effects,
-                            { target: "relation", key: "relation", op: "add", value: -1 },
-                          ],
-                        })
-                      }
-                    >
-                      <Plus className="h-3 w-3" /> эффект
-                    </Btn>
+                {/* 2/3. Условия («И») */}
+                <div className="mt-3 border-t border-line pt-3">
+                  <div className="text-xs font-medium uppercase tracking-wide text-muted">
+                    Условия (все должны выполняться)
                   </div>
-                  <div className="flex flex-col gap-1.5">
-                    {b.effects.map((eff, ei) => {
-                      const setEff = (patch: Partial<typeof eff>) =>
-                        setB({
-                          effects: b.effects.map((x, i) => (i === ei ? { ...x, ...patch } : x)),
-                        });
-                      return (
-                        <div key={ei} className="flex items-center gap-2">
-                          <Select
-                            value={eff.target}
-                            onChange={(v) =>
-                              setEff({
-                                target: v as "relation" | "self",
-                                key: v === "relation" ? "relation" : attributes[0]?.key ?? "mood",
-                                op: "add",
-                              })
-                            }
-                            className="min-w-40 flex-1"
-                            options={[
-                              { value: "relation", label: "отношение к актёру" },
-                              { value: "self", label: "своё состояние" },
-                            ]}
-                          />
-                          {eff.target === "self" && (
-                            <div className="min-w-0 flex-1">
-                              <Select
-                                value={eff.key}
-                                onChange={(v) => setEff({ key: v })}
-                                options={attributes.map((a) => ({
-                                  value: a.key,
-                                  label: `${a.emoji ? a.emoji + " " : ""}${a.label}`,
-                                }))}
-                              />
-                            </div>
-                          )}
-                          <Select
-                            value={eff.op}
-                            onChange={(v) => setEff({ op: v as "set" | "add" })}
-                            className="w-16 shrink-0"
-                            options={[
-                              { value: "add", label: "+" },
-                              { value: "set", label: "=" },
-                            ]}
-                          />
-                          <Input
-                            type="number"
-                            value={typeof eff.value === "number" ? eff.value : Number(eff.value) || 0}
-                            onChange={(e) => setEff({ value: Number(e.target.value) })}
-                            className="w-20 shrink-0"
-                          />
-                          <IconBtn
-                            variant="danger"
-                            label="Удалить эффект"
-                            onClick={() =>
-                              setB({ effects: b.effects.filter((_, i) => i !== ei) })
-                            }
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </IconBtn>
-                        </div>
-                      );
-                    })}
-                    {b.effects.length === 0 && (
+                  <div className="mt-1.5 flex flex-col gap-1.5">
+                    {b.conditions.map((cond, ci) => (
+                      <ConditionRow
+                        key={ci}
+                        cond={cond}
+                        onChange={(next) =>
+                          setB({ conditions: b.conditions.map((x, i) => (i === ci ? next : x)) })
+                        }
+                        onRemove={() =>
+                          setB({ conditions: b.conditions.filter((_, i) => i !== ci) })
+                        }
+                        attributes={attributes}
+                        places={places}
+                        slots={clothingSlots}
+                      />
+                    ))}
+                    {b.conditions.length === 0 && (
                       <p className="text-xs text-muted/70">
-                        Без последствий: отказ просто не пропускает действие.
+                        Добавьте хотя бы одно условие — иначе правило никогда не сработает.
                       </p>
                     )}
+                  </div>
+                  <Btn
+                    variant="ghost"
+                    className="mt-1.5 h-6 px-2 text-[11px]"
+                    onClick={() =>
+                      setB({
+                        conditions: [...b.conditions, { kind: "relation", op: ">=", value: 3 }],
+                      })
+                    }
+                  >
+                    <Plus className="h-3 w-3" /> условие
+                  </Btn>
+                </div>
+
+                {/* 3/3. Отказ */}
+                <div className="mt-3 border-t border-line pt-3">
+                  <div className="text-xs font-medium uppercase tracking-wide text-muted">
+                    Отказ
+                  </div>
+                  <div className="mt-1.5">
+                    <Field label="Текст отказа (от лица персонажа)">
+                      <Input
+                        value={b.refusalText}
+                        onChange={(e) => setB({ refusalText: e.target.value })}
+                        placeholder="мягко уклоняется: слишком рано"
+                      />
+                    </Field>
+                  </div>
+
+                  <div className="mt-2">
+                    <div className="mb-1 flex items-center justify-between">
+                      <span className="text-xs font-medium uppercase tracking-wide text-muted">
+                        Последствия отказа
+                      </span>
+                      <Btn
+                        variant="ghost"
+                        className="h-6 px-2 text-[11px]"
+                        onClick={() =>
+                          setB({
+                            effects: [
+                              ...b.effects,
+                              { target: "relation", key: "relation", op: "add", value: -1 },
+                            ],
+                          })
+                        }
+                      >
+                        <Plus className="h-3 w-3" /> эффект
+                      </Btn>
+                    </div>
+                    <div className="flex flex-col gap-1.5">
+                      {b.effects.map((eff, ei) => {
+                        const setEff = (patch: Partial<typeof eff>) =>
+                          setB({
+                            effects: b.effects.map((x, i) => (i === ei ? { ...x, ...patch } : x)),
+                          });
+                        return (
+                          <div key={ei} className="flex items-center gap-2">
+                            <Select
+                              value={eff.target}
+                              onChange={(v) =>
+                                setEff({
+                                  target: v as "relation" | "self",
+                                  key: v === "relation" ? "relation" : attributes[0]?.key ?? "mood",
+                                  op: "add",
+                                })
+                              }
+                              className="min-w-40 flex-1"
+                              options={[
+                                { value: "relation", label: "отношение к актёру" },
+                                { value: "self", label: "своё состояние" },
+                              ]}
+                            />
+                            {eff.target === "self" && (
+                              <div className="min-w-0 flex-1">
+                                <Select
+                                  value={eff.key}
+                                  onChange={(v) => setEff({ key: v })}
+                                  options={attributes.map((a) => ({
+                                    value: a.key,
+                                    label: `${a.emoji ? a.emoji + " " : ""}${a.label}`,
+                                  }))}
+                                />
+                              </div>
+                            )}
+                            <Select
+                              value={eff.op}
+                              onChange={(v) => setEff({ op: v as "set" | "add" })}
+                              className="w-16 shrink-0"
+                              options={[
+                                { value: "add", label: "+" },
+                                { value: "set", label: "=" },
+                              ]}
+                            />
+                            <Input
+                              type="number"
+                              value={typeof eff.value === "number" ? eff.value : Number(eff.value) || 0}
+                              onChange={(e) => setEff({ value: Number(e.target.value) })}
+                              className="w-20 shrink-0"
+                            />
+                            <IconBtn
+                              variant="danger"
+                              label="Удалить эффект"
+                              onClick={() =>
+                                setB({ effects: b.effects.filter((_, i) => i !== ei) })
+                              }
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </IconBtn>
+                          </div>
+                        );
+                      })}
+                      {b.effects.length === 0 && (
+                        <p className="text-xs text-muted/70">
+                          Без последствий: отказ просто не пропускает действие.
+                        </p>
+                      )}
+                    </div>
                   </div>
                 </div>
               </div>
@@ -712,28 +1095,14 @@ export default function CharacterEditorPage({
           variant="ghost"
           className="mt-3"
           onClick={() =>
-            setForm((f) => ({
-              ...f,
-              boundaries: [
-                ...f.boundaries,
-                {
-                  toolName: tools.find((t) => t.audience === "target")?.name ?? "*",
-                  minRelation: 3,
-                  minMood: null,
-                  requirePlace: null,
-                  requireAttr: null,
-                  refusalText: "мягко уклоняется: слишком рано",
-                  effects: [{ target: "relation", key: "relation", op: "add", value: -1 }],
-                },
-              ],
-            }))
+            setForm((f) => ({ ...f, boundaries: [...f.boundaries, defaultBoundary()] }))
           }
         >
           <Plus className="h-4 w-4" /> Правило
         </Btn>
       </Card>
 
-      <Card className="p-5">
+      <Card className="mb-4 p-5">
         <div className="mb-3 flex flex-wrap items-center gap-2">
           <div className="text-sm font-medium">Характеристики</div>
           <Badge>видно только этому персонажу</Badge>
@@ -891,27 +1260,34 @@ export default function CharacterEditorPage({
           </div>
         )}
 
-        {extraKeys.length > 0 && (
+        {(extraKeys.length > 0 || hasWardrobeKeys) && (
           <div className="mt-4 border-t border-line pt-3">
             <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted">
               Другие поля state (нет в реестре)
             </div>
-            <div className="grid gap-3 sm:grid-cols-3">
-              {extraKeys.map((k) => (
-                <Field key={k} label={k}>
-                  <Input
-                    value={String(stateObj?.[k] ?? "")}
-                    onChange={(e) => setAttrValue(k, e.target.value, "text")}
-                  />
-                </Field>
-              ))}
-            </div>
+            {hasWardrobeKeys && (
+              <p className="mb-3 text-xs text-muted">
+                worn_*/carried_* управляются гардеробом — смотрите карточку «Гардероб» ниже.
+              </p>
+            )}
+            {extraKeys.length > 0 && (
+              <div className="grid gap-3 sm:grid-cols-3">
+                {extraKeys.map((k) => (
+                  <Field key={k} label={k}>
+                    <Input
+                      value={String(stateObj?.[k] ?? "")}
+                      onChange={(e) => setAttrValue(k, e.target.value, "text")}
+                    />
+                  </Field>
+                ))}
+              </div>
+            )}
           </div>
         )}
 
         <details className="mt-4">
           <summary className="cursor-pointer text-xs text-muted hover:text-fg">
-            продвинутый: весь state в JSON
+            продвинутый: весь state в JSON (null — удалить ключ; сохранение мёржит по ключам)
           </summary>
           <div className="mt-2">
             <Textarea
@@ -929,6 +1305,105 @@ export default function CharacterEditorPage({
           </div>
         </details>
       </Card>
+
+      {!isNew && (
+        <Card className="p-5">
+          <div className="mb-1 flex flex-wrap items-center gap-2">
+            <Shirt className="h-4 w-4 text-accent" />
+            <div className="text-sm font-medium">Гардероб</div>
+            <Badge>эффекты предмета действуют, пока он надет</Badge>
+          </div>
+          <p className="mb-3 text-xs text-muted">
+            Личный шкаф персонажа. Каталог и цены — в разделе „Гардероб“ (/wardrobe).
+          </p>
+
+          <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted">
+            Надето
+          </div>
+          {wardrobe.slots.length === 0 ? (
+            <p className="text-xs text-muted">
+              Слоты одежды не заданы — создайте их в разделе «Характеристики».
+            </p>
+          ) : (
+            <div className="flex flex-col gap-2">
+              {wardrobe.slots.map((s) => {
+                const slotOwned = wardrobe.owned.filter((g) => g.slot === s.slot);
+                // Чем снимать: надетый предмет; если его нет в гардеробе — любой из слота.
+                const removeId = s.garmentId ?? slotOwned[0]?.id ?? null;
+                const currentValue =
+                  s.garmentId != null ? String(s.garmentId) : s.worn ? "__worn__" : "";
+                return (
+                  <div
+                    key={s.slot}
+                    className="flex flex-wrap items-center gap-3 rounded-lg border border-line bg-panel-2/40 px-3 py-2"
+                  >
+                    <div className="w-36 shrink-0">
+                      <div className="font-mono text-xs text-fg">{s.slot}</div>
+                      <div className="text-xs text-muted">{s.worn ?? "— пусто —"}</div>
+                    </div>
+                    <Select
+                      value={currentValue}
+                      onChange={(v) => {
+                        if (v === currentValue || v === "" || v === "__worn__") return;
+                        if (v === "__remove__") {
+                          if (removeId != null) void applyWardrobe(removeId, "remove");
+                          return;
+                        }
+                        void applyWardrobe(Number(v), "wear");
+                      }}
+                      options={[
+                        s.worn
+                          ? removeId != null
+                            ? { value: "__remove__", label: "— снять —" }
+                            : { value: "__worn__", label: `надето: ${s.worn}` }
+                          : { value: "", label: "— надеть —" },
+                        ...slotOwned.map((g) => ({
+                          value: String(g.id),
+                          label: `${g.emoji} ${g.name}`,
+                        })),
+                      ]}
+                      className="min-w-44 flex-1"
+                      disabled={wardrobeBusy}
+                    />
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          <div className="mt-4 border-t border-line pt-3">
+            <div className="mb-2 text-xs font-medium uppercase tracking-wide text-muted">
+              В шкафу
+            </div>
+            {closetGarments.length === 0 ? (
+              <p className="text-xs text-muted">
+                Пусто — выданные, но не надетые вещи появятся здесь.
+              </p>
+            ) : (
+              <div className="flex flex-wrap gap-2">
+                {closetGarments.map((g) => (
+                  <button
+                    key={g.id}
+                    type="button"
+                    disabled={wardrobeBusy}
+                    onClick={() => void applyWardrobe(g.id, "wear")}
+                    className="flex items-center gap-1.5 rounded-lg border border-line bg-panel-2/50 px-3 py-1.5 text-xs text-fg transition-colors hover:border-accent/50 disabled:opacity-50"
+                    title={g.slot ? `Надеть в слот ${g.slot}` : "Надеть"}
+                  >
+                    <span className="text-base leading-none">{g.emoji}</span>
+                    <span>{g.name}</span>
+                    {g.slot && (
+                      <span className="rounded bg-black/30 px-1.5 py-0.5 font-mono text-[10px] text-muted">
+                        {g.slot}
+                      </span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+        </Card>
+      )}
     </div>
   );
 }

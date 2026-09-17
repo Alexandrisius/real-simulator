@@ -2,6 +2,7 @@
 
 import { NextResponse } from "next/server";
 import { z } from "zod";
+import type { BoundaryCondition } from "./types";
 import { toolDraftPatchSchema } from "./toolRequests";
 
 export const providerSchema = z.object({
@@ -50,9 +51,42 @@ export const toolSchema = z.object({
   cost: z.number().min(0).max(1_000_000).optional().default(0),
   trainsSkill: z.string().regex(/^[a-z0-9_]{0,24}$/).optional().default(""),
   outcomes: z.array(outcomeSchema).optional().default([]),
+  /** Адресный тул исполняется только после согласия получателя (оффер) */
+  requiresConsent: z.boolean().optional().default(false),
+  /** Эффекты при отклонении предложения получателем */
+  declineEffects: z.array(toolEffectSchema).optional().default([]),
 });
 
-/** Требование на истинный атрибут в границе персонажа. */
+/**
+ * Условие границы (дискриминант kind): отношение владельца к актёру, истинный
+ * атрибут актёра/владельца, место сцены или слот одежды владельца. Ключ attr
+ * здесь любая непустая строка — сверку с реестром характеристик делает UI.
+ */
+export const boundaryConditionSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("relation"),
+    op: z.enum([">=", "<", "="]),
+    value: z.number(),
+  }),
+  z.object({
+    kind: z.literal("attr"),
+    owner: z.enum(["actor", "target"]),
+    key: z.string().min(1, "Ключ характеристики обязателен"),
+    op: z.enum([">=", "<", "="]),
+    value: z.number(),
+  }),
+  z.object({
+    kind: z.literal("place"),
+    place: z.string().min(1, "Место обязательно").max(40),
+  }),
+  z.object({
+    kind: z.literal("worn"),
+    slot: z.string().min(1, "Слот обязателен").max(32),
+    bare: z.boolean(),
+  }),
+]);
+
+/** Легаси-требование на истинный атрибут в границе персонажа. */
 const boundaryRequireAttrSchema = z.object({
   owner: z.enum(["actor", "target"]),
   key: z.string().min(1),
@@ -60,16 +94,55 @@ const boundaryRequireAttrSchema = z.object({
   value: z.number(),
 });
 
-/** Правило-граница персонажа (согласие на адресный инструмент). */
-export const boundarySchema = z.object({
-  toolName: z.string().min(1),
-  minRelation: z.number().nullable().optional().default(null),
-  minMood: z.number().nullable().optional().default(null),
-  requirePlace: z.string().max(40).nullable().optional().default(null),
-  requireAttr: boundaryRequireAttrSchema.nullable().optional().default(null),
-  refusalText: z.string().min(1, "Текст отказа обязателен").max(300),
-  effects: z.array(toolEffectSchema).optional().default([]),
-});
+/**
+ * Правило-граница персонажа (согласие на адресный инструмент). Основная форма —
+ * массив conditions («И»); легаси-поля (minRelation/minAttr/minMood/
+ * requirePlace/requireAttr) тоже принимаются и на трансформе переписываются
+ * в conditions ровно как queries.ts:mapBoundary — PATCH только с легаси-полями
+ * работает. В выходе — нормализованный conditions плюс всё, что передали.
+ */
+export const boundarySchema = z
+  .object({
+    toolName: z.string().min(1),
+    /** Когда правило действует: на попытки других (default) / на мои действия / всегда */
+    scope: z.enum(["incoming", "outgoing", "both"]).optional().default("incoming"),
+    conditions: z.array(boundaryConditionSchema).optional(),
+    minRelation: z.number().nullable().optional(),
+    minAttr: z
+      .object({ key: z.string().min(1, "Ключ обязателен"), value: z.number() })
+      .nullable()
+      .optional(),
+    minMood: z.number().nullable().optional(),
+    requirePlace: z.string().max(40).nullable().optional(),
+    requireAttr: boundaryRequireAttrSchema.nullable().optional(),
+    refusalText: z.string().min(1, "Текст отказа обязателен").max(300),
+    effects: z.array(toolEffectSchema).optional().default([]),
+  })
+  .transform(({ conditions, ...rest }) => {
+    if (conditions) return { ...rest, conditions }; // условия переданы явно — легаси-поля не трогаем
+    const mapped: BoundaryCondition[] = [];
+    if (typeof rest.minRelation === "number") {
+      mapped.push({ kind: "relation", op: ">=", value: rest.minRelation });
+    }
+    if (rest.minAttr) {
+      mapped.push({ kind: "attr", owner: "target", key: rest.minAttr.key, op: ">=", value: rest.minAttr.value });
+    } else if (typeof rest.minMood === "number") {
+      mapped.push({ kind: "attr", owner: "target", key: "mood", op: ">=", value: rest.minMood });
+    }
+    if (rest.requirePlace) {
+      mapped.push({ kind: "place", place: rest.requirePlace });
+    }
+    if (rest.requireAttr) {
+      mapped.push({
+        kind: "attr",
+        owner: rest.requireAttr.owner,
+        key: rest.requireAttr.key,
+        op: rest.requireAttr.op,
+        value: rest.requireAttr.value,
+      });
+    }
+    return { ...rest, conditions: mapped };
+  });
 
 export const characterSchema = z.object({
   name: z.string().min(1, "Имя обязательно"),
@@ -77,6 +150,9 @@ export const characterSchema = z.object({
   persona: z.string().optional().default(""),
   providerId: z.number().int().positive().nullable().optional(),
   model: z.string().optional().default(""),
+  /** Страховочный провайдер: подхватывает ход при отказе/обрыве основной модели */
+  fallbackProviderId: z.number().int().positive().nullable().optional(),
+  fallbackModel: z.string().optional().default(""),
   temperature: z.number().min(0).max(2).optional().default(0.8),
   maxTokens: z.number().int().min(16).max(128000).optional().default(1024),
   toolIds: z.array(z.number().int().positive()).optional().default([]),
@@ -84,6 +160,34 @@ export const characterSchema = z.object({
   isHuman: z.boolean().optional().default(false),
   income: z.number().min(0).max(1_000_000_000).optional().default(0),
   boundaries: z.array(boundarySchema).optional().default([]),
+});
+
+/** Условие авто-финиша сцены (движок проверяет после каждого хода). */
+export const finishConditionSchema = z.discriminatedUnion("type", [
+  z.object({
+    type: z.literal("toolCall"),
+    toolName: z.string().min(1, "Выберите инструмент"),
+    characterId: z.number().int().positive().optional(),
+  }),
+  z.object({
+    type: z.literal("outcome"),
+    toolName: z.string().min(1, "Выберите инструмент"),
+    outcomeId: z.string().min(1, "Выберите исход"),
+    characterId: z.number().int().positive().optional(),
+  }),
+  z.object({
+    type: z.literal("state"),
+    characterId: z.number().int().positive().optional(),
+    key: z.string().min(1, "Ключ состояния обязателен"),
+    op: z.enum([">=", "<", "="]),
+    value: z.number(),
+  }),
+]);
+
+/** Настройка авто-финиша: условия («И») + сколько ходов досидеть после. */
+const sceneFinishSchema = z.object({
+  conditions: z.array(finishConditionSchema).max(10, "Условий финиша — не больше 10"),
+  delayTurns: z.number().int().min(0).max(1000).optional().default(0),
 });
 
 export const sceneConfigSchema = z.object({
@@ -96,6 +200,10 @@ export const sceneConfigSchema = z.object({
   maxApiCallsPerScene: z.number().int().min(0).max(1000000).optional(),
   maxTokensPerScene: z.number().int().min(0).max(2000000000).optional(),
   allowToolRequests: z.boolean().optional(),
+  /** Агенты могут отвечать на предложения и покидать сцену (respond_to_offer/leave_scene) */
+  allowAgentStops: z.boolean().optional(),
+  /** Авто-финиш: условия + задержка; null = выключить */
+  finish: sceneFinishSchema.nullable().optional(),
   place: z.string().max(40, "Место — до 40 символов").optional(),
 });
 
@@ -258,6 +366,54 @@ export const productSchema = z.object({
   slot: z.string().max(32).optional().default(""),
 });
 
+// ---- Гардероб: предметы одежды ----
+
+export const garmentSchema = z.object({
+  name: z
+    .string()
+    .min(1, "Название обязательно")
+    .max(40, "Название — до 40 символов")
+    .regex(/^[а-яёa-z0-9][а-яёa-z0-9\s-]*$/i, "Буквы, цифры, пробел и дефис"),
+  emoji: z.string().optional().default("👕"),
+  description: z.string().max(300).optional().default(""),
+  /** Слот из реестра clothing_slots ('' = предмет без слота) */
+  slot: z.string().max(32).optional().default(""),
+  effects: z.array(productEffectSchema).optional().default([]),
+  price: z.number().min(0, "Цена не может быть отрицательной").max(1_000_000).optional().default(0),
+});
+
+// ---- Комбо: цепочка вызовов с наградой ----
+
+export const comboSchema = z.object({
+  name: z.string().min(1, "Название обязательно").max(40, "Название — до 40 символов"),
+  title: z.string().min(1, "Заголовок обязателен").max(80, "Заголовок — до 80 символов"),
+  description: z.string().max(500).optional().default(""),
+  steps: z
+    .array(
+      z.object({
+        toolName: z.string().min(1, "Выберите инструмент"),
+        /** Кто должен совершить шаг (имя участника; пусто = любой) */
+        actorName: z.string().max(60).nullable().optional().default(null),
+        /** На кого направлен шаг (имя участника; пусто = любой) */
+        targetName: z.string().max(60).nullable().optional().default(null),
+      })
+    )
+    .min(1, "Нужен хотя бы один шаг")
+    .max(10, "Шагов в комбо — не больше 10"),
+  windowTurns: z.number().int().min(1).max(100).optional().default(10),
+  effects: z.array(toolEffectSchema).optional().default([]),
+  /** id персонажей, знающих рецепт (пусто = никто: секретное достижение) */
+  knowers: z.array(z.number().int().positive()).optional().default([]),
+  /** Объявить срабатывание всем участникам («достижение открыто») */
+  announce: z.boolean().optional().default(true),
+});
+
+/** Действие над гардеробом персонажа: надеть предмет / снять его со слота. */
+export const wardrobeActionSchema = z.object({
+  garmentId: z.number().int().positive(),
+  action: z.enum(["wear", "remove"]),
+});
+
 // ---- Реестр характеристик ----
 
 export const attributeSchema = z.object({
@@ -286,6 +442,8 @@ export const clothingSlotSchema = z.object({
     .regex(/^[a-z0-9_]{1,24}$/, "Слот: латиница строчными/цифры/_, до 24 символов"),
   layer: z.number().int().min(1).max(10).optional().default(1),
   undressPlaces: z.array(z.string().max(40)).optional().default([]),
+  /** Эффекты пустого слота: пока слот не надет — действуют на владельца */
+  bareEffects: z.array(toolEffectSchema).optional().default([]),
   position: z.number().int().min(0).max(100).optional().default(0),
 });
 

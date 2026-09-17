@@ -11,7 +11,7 @@ import { resolveTargetByName } from "./tools";
 
 export { GO_TOOL_NAME, INVITE_TOOL_NAME } from "./types";
 
-const placeListText = () =>
+export const placeListText = () =>
   listPlaces()
     .map((p) => `«${p.name}»${p.description ? ` — ${p.description}` : ""}`)
     .join("; ");

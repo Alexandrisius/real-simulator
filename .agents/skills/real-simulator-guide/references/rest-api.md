@@ -19,6 +19,7 @@ curl -s "http://localhost:3999/api/providers/1/models?test=1"
 ## Инструменты
 
 ```bash
+# Обычный адресный тул
 curl -s http://localhost:3999/api/tools -H "Content-Type: application/json" -d '{
   "name": "compliment",
   "title": "Сделать комплимент",
@@ -36,6 +37,26 @@ curl -s http://localhost:3999/api/tools -H "Content-Type: application/json" -d '
               {"target": "tool_target", "key": "mood", "op": "add", "value": 1}],
   "cost": 0
 }'
+
+# Инструмент с согласием получателя: вызов создаёт предложение,
+# действие исполняется только после respond_to_offer decision=accept.
+# declineEffects — эффекты отказа (на отказавшегося и его чувства).
+curl -s http://localhost:3999/api/tools -H "Content-Type: application/json" -d '{
+  "name": "kiss",
+  "title": "Поцеловать",
+  "description": "Мягко поцеловать собеседника.",
+  "parametersSchema": {
+    "type": "object",
+    "properties": {"to": {"type": "string", "x-entity": "character"}},
+    "required": ["to"]
+  },
+  "audience": "target",
+  "targetParam": "to",
+  "observationTemplate": "{name} целует {to}",
+  "effects": [{"target": "relation", "key": "relation", "op": "add", "value": 1}],
+  "requiresConsent": true,
+  "declineEffects": [{"target": "tool_target", "key": "mood", "op": "add", "value": -1}]
+}'
 ```
 
 `effects.target`: `self` | `tool_target` (получателю в ключ `key`) | `relation`
@@ -46,6 +67,24 @@ curl -s http://localhost:3999/api/tools -H "Content-Type: application/json" -d '
 Исходы (`outcomes`) — массив `{id, title, conditions, effects, noticeTarget,
 hideFromPrompt}`, условие: `{kind: "actor_attr"|"target_attr"|"relation"|"place"|"worn"|"chemistry", key, op: ">="|"<"|"=", value}`
 (в условиях `key` может быть пустым — для `relation`/`place`/`worn`).
+
+**Согласие (offers)**: тул с `requiresConsent: true` при вызове не исполняется —
+создаётся предложение (живёт 6 ходов), а цель в свой ход вызывает виртуальный
+тул вручную или моделью:
+
+```bash
+# Ответить за персонажа на предложение #3 (id предложений — в промпте цели
+# и в событиях сцены): accept = исполнить тул от имени автора,
+# decline = применить declineEffects
+curl -s http://localhost:3999/api/scenes/1/act -H "Content-Type: application/json" \
+  -d '{"characterId":2,"toolName":"respond_to_offer","args":{"offer":"3","decision":"accept","words":"Ну… давай"}}'
+```
+
+**`x-entity`**: свойство схемы с `"x-entity": "character" | "place" |
+"product" | "slot" | "attribute"` получает на каждый ход `enum` реальных
+значений реестра (у `targetParam` — имена участников, он в аннотации не
+нуждается). Аннотация вырезается из схемы до отправки модели; выдуманное
+значение отклоняется ошибкой со списком («Выбери из: …»).
 
 ## Реестры: характеристики, навыки, места, одежда, товары
 
@@ -58,13 +97,27 @@ curl -s http://localhost:3999/api/attributes -H "Content-Type: application/json"
 curl -s http://localhost:3999/api/skills -H "Content-Type: application/json" \
   -d '{"key":"sex","label":"Секс","maxLevel":5,"practicePerLevel":10,"grows":true}'
 
-# Место сцены
+# Место сцены (реестр мест; из него выбирается config.place и строятся go_to/invite)
 curl -s http://localhost:3999/api/places -H "Content-Type: application/json" \
   -d '{"name":"кафе","description":"Уютная кофейня в центре"}'
 
-# Слот одежды (layer 1 = верхнее, 2 = бельё; undressPlaces — где можно обнажить)
+# Переименовать место: каскад обновит config.place сцен, undressPlaces слотов,
+# requirePlace границ и place-условия исходов; коллизия имён → 409
+# (нестандартные символы в пути — процентная кодировка: кафе = %D0%BA%D0%B0%D1%84%D0%B5)
+curl -s -X PATCH http://localhost:3999/api/places/%D0%BA%D0%B0%D1%84%D0%B5 -H "Content-Type: application/json" \
+  -d '{"name":"кофейня у метро"}'
+
+# Слот одежды (layer 1 = верхнее, 2 = бельё; undressPlaces — где можно обнажить,
+# bareEffects — эффекты ПУСТОГО слота, пока он не надет)
 curl -s http://localhost:3999/api/clothing-slots -H "Content-Type: application/json" \
-  -d '{"slot":"top","layer":1,"undressPlaces":[]}'
+  -d '{"slot":"underwear","layer":2,"undressPlaces":["дом"],"bareEffects":[{"target":"self","key":"anxiety","op":"add","value":1}]}'
+
+# Одежда (гардероб): слот из реестра слотов (или пусто — просто хранится),
+# эффекты действуют «пока надето»; price > 0 → продаётся в магазине
+curl -s http://localhost:3999/api/garments -H "Content-Type: application/json" -d '{
+  "name":"Джинсы","emoji":"👖","description":"Обычные синие джинсы",
+  "slot":"bottom","price":40,
+  "effects":[{"target":"self","key":"looks","op":"add","value":1}]}'
 
 # Товар магазина (slot → сразу надевается; delayScenes → эффект через N сцен)
 curl -s http://localhost:3999/api/products -H "Content-Type: application/json" -d '{
@@ -95,17 +148,30 @@ curl -s http://localhost:3999/api/characters -H "Content-Type: application/json"
   "income": 1200,
   "boundaries": [{
     "toolName": "kiss",
-    "minRelation": 3,
-    "minMood": 2,
-    "requirePlace": "дом",
-    "requireAttr": {"owner": "actor", "key": "hygiene", "op": ">=", "value": 5},
+    "scope": "incoming",
+    "conditions": [
+      {"kind": "relation", "op": ">=", "value": 3},
+      {"kind": "attr", "owner": "target", "key": "mood", "op": ">=", "value": 2},
+      {"kind": "place", "place": "дом"},
+      {"kind": "attr", "owner": "actor", "key": "hygiene", "op": ">=", "value": 5}
+    ],
     "refusalText": "Яна отстраняется: «Мы не на той стадии».",
     "effects": [{"target": "relation", "key": "", "op": "add", "value": -1}]
   }]
-}'
+}
 ```
 
-`state` — свободный JSON, но ключи атрибутов должны быть в реестре
+Условия («И»): `relation` (отношение владельца к партнёру), `attr` с
+`owner: "actor"|"target"` (истинный state того, кто действует / на кого
+действуют), `place`, `worn {slot, bare}`. `scope`: `incoming` (по умолчанию —
+когда действуют на владельца), `outgoing` (когда владелец сам действует на
+других — «не сплю с теми, у кого…»), `both`. Легаси-поля `minRelation`/
+`minAttr`/`minMood`/`requirePlace`/`requireAttr` ещё принимаются и
+переписываются в `conditions`.
+
+`PATCH /api/characters/:id` со `state` **мёржит по ключам** (полная замена
+стерла бы свежие изменения движка); `null` в значении удаляет ключ. `state` —
+свободный JSON, но ключи атрибутов должны быть в реестре
 (значения клампятся по min/max). `money` — атрибут «Деньги» из дефолтного
 сида (min 0): его списание делает `cost` тулов, начисление — доход во флоу.
 Для человека: `isHuman: true` (providerId и model не нужны). Списки:
@@ -126,7 +192,15 @@ curl -s http://localhost:3999/api/scenes -H "Content-Type: application/json" -d 
     "turnDelayMs": 1500,
     "pauseForHumans": false,
     "allowToolRequests": true,
-    "rulesExtra": "Никто не уходит до полуночи."
+    "allowAgentStops": true,
+    "rulesExtra": "Никто не уходит до полуночи.",
+    "finish": {
+      "conditions": [
+        {"type": "toolCall", "toolName": "kiss", "characterId": 1},
+        {"type": "state", "key": "mood", "op": ">=", "value": 5}
+      ],
+      "delayTurns": 2
+    }
   },
   "goals": {"1": "Выяснить, где Саша был вчера, не выдав интереса.",
             "2": "Скрыть опоздание в бар и перевести тему на Яну."},
@@ -159,9 +233,54 @@ curl -s http://localhost:3999/api/scenes/1/scores
 curl -s -X POST http://localhost:3999/api/scenes/1/reset
 ```
 
-`reset` стирает события/курсор/траты, но сохраняет участников, цели и привязки
-схем — удобно для повторных прогонов. Live-лента: SSE `GET /api/stream`
+`reset` стирает события/курсор/траты, а также предложения, блокировки и
+флаги `left_scene`, но сохраняет участников, цели и привязки схем — удобно
+для повторных прогонов. Live-лента: SSE `GET /api/stream`
 (`curl -N`), фильтрация по видимости на клиенте.
+
+`config.finish` (если задан): когда все условия выполнены (считаются только
+исполненные вызовы, предложения не считаются), сцена доигрывает `delayTurns`
+ходов и завершается сама. Типы условий: `toolCall` (успешный вызов тула,
+опц. `characterId`), `outcome` (`toolName` + `outcomeId`), `state`
+(`key`, `op: ">="|"<"|"="`, `value`, опц. `characterId`); максимум 10, «И».
+
+## Гардероб персонажа и комбо
+
+```bash
+# Вид гардероба: что лежит (owned) и что надето по слотам
+curl -s http://localhost:3999/api/characters/2/wardrobe
+
+# Надеть (выдаёт предмет во владение и применяет эффекты ношения) / снять
+curl -s -X POST http://localhost:3999/api/characters/2/wardrobe -H "Content-Type: application/json" \
+  -d '{"garmentId":1,"action":"wear"}'        # или "remove" (worn → carried)
+
+# Комбо: скрытая цепочка вызовов; steps — существующие тула (порядок важен),
+# actorName/targetName — фильтры «кто делает»/«на кого» (необязательно),
+# knowers — id персонажей, видящих подсказку с порядком шагов (пусто = секретное
+# достижение, рецепт не знает никто), announce — объявить срабатывание всем
+curl -s http://localhost:3999/api/combos -H "Content-Type: application/json" -d '{
+  "name": "wave",
+  "title": "Волна",
+  "description": "Поцелуй, массаж и смена позы — и её накрывает волной.",
+  "steps": [{"toolName": "kiss", "targetName": "Яна"}, {"toolName": "massage", "targetName": "Яна"}, {"toolName": "pose_change", "targetName": "Яна"}],
+  "windowTurns": 8,
+  "effects": [{"target": "tool_target", "key": "arousal", "op": "add", "value": 3}],
+  "knowers": [2],
+  "announce": true
+}'
+
+curl -s http://localhost:3999/api/combos          # список
+curl -s -X PATCH http://localhost:3999/api/combos/1 -H "Content-Type: application/json" -d '{…}'
+curl -s -X DELETE http://localhost:3999/api/combos/1
+```
+
+Комбо срабатывает, когда шаги исполнены **точно по порядку** в пределах
+`windowTurns` ходов (предложения и `ok:false` не считаются; реплики и чужие
+посторонние вызовы цепочку не рвут; исполнение по согласию — полноправный
+шаг); раз за сцену. С `targetName` шаг засчитывается только направленным на
+этого участника. `announce:true` объявляет срабатывание всем участникам
+событием мира («достижение открыто»). `steps`/`knowers` проверяются на
+существование (400 при битых ссылках), `name` уникален (409).
 
 ## Схемы валидации
 

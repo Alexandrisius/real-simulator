@@ -24,7 +24,7 @@ import {
   WEAR_TOOL_NAME,
   WORN_PREFIX,
 } from "./types";
-import { getSetting } from "@/db/queries";
+import { getSetting, listPlaces } from "@/db/queries";
 
 export interface BuildContextOptions {
   character: Character;
@@ -50,6 +50,18 @@ export interface BuildContextOptions {
   hasHiddenAttributes?: boolean;
   /** Моделируется ли одежда (доступны undress/wear) */
   hasClothing?: boolean;
+  /** Есть ли у персонажа тулы-предложения (requiresConsent) или висящие предложения */
+  hasConsentTools?: boolean;
+  /** Доступны ли стоп-инструменты (leave_scene / block_character) */
+  allowStops?: boolean;
+  /** Входящие предложения персонажу: ответить respond_to_offer в этот ход */
+  pendingOffers?: { id: number; toolTitle: string; fromName: string }[];
+  /** Исходящие предложения персонажа: ждут ответа, не повторять */
+  outgoingOffers?: { id: number; toolTitle: string; toName: string }[];
+  /** Заблокированные пары (в обе стороны): эти участники друг друга не видят */
+  blockedNames?: string[];
+  /** Секреты персонажа: комбо, последовательности которых он знает */
+  comboSecrets?: { title: string; description: string; steps: string[] }[];
 }
 
 /**
@@ -68,21 +80,21 @@ export const PROMPT_SECTIONS: { key: string; title: string; hint: string; def: s
     key: "rules_reply",
     title: "Правила: как отвечать",
     hint: "подстановка {name} — имя персонажа",
-    def: `# Как отвечать
-- Ты видишь историю сцены: реплики и действия участников, которые тебе видны. Личные сообщения приходят только тебе.
-- Отвечай СТРОГО от лица {name}: соблюдай характер, манеру речи и цели персонажа.
-- Хочешь сказать — просто напиши реплику текстом. Хочешь что-то сделать — вызови подходящий инструмент (function calling). Можно совмещать: действие + реплика.
-- Никогда не пиши реплики и действия за других персонажей и не выдумывай события, которых не было.
-- Реагируй на происходящее естественно, помни всё, что уже произошло.`,
+    def: `# Как отвечать: мысли и речь — разные вещи
+- Твой текст БЕЗ тула — это ВНУТРЕННИЕ МЫСЛИ. Их никто не слышит: ни другие персонажи, ни мир. Мысли видит только Архитектор симуляции (наблюдатель). Не жди ответа на мысли.
+- Чтобы тебя УСЛЫШАЛИ — только инструменты: say (сказать вслух, слышат все или один адресат), text_message (сообщение в переписке — для телефона/чата). Мысли короткие: 1–3 предложения, по делу.
+- Никогда не пиши реплики и действия за других персонажей и не выдумывай события, которых не было. Чужие мысли ты не знаешь — только то, что тебе сказали/показали тулами.
+- Реагируй на происходящее естественно, помни всё, что уже произошло. Не повторяй одно и то же действие — разнообразь.`,
   },
   {
     key: "rules_actions",
     title: "Правила: действия",
     hint: "почему всё делается инструментами",
     def: `# Правила этого мира: действия
-- Инструментами делается то, что МЕНЯЕТ мир: характеристики (настроение, внешность, деньги…), отношения людей, состояние одежды, шансы в цели. Такие действия словами не считаются — пока инструмент не вызван, ничего не произошло.
-- Атмосфера, разговоры, эмоции, флирт в чате — отыгрывай обычными репликами, инструменты для этого не нужны. Специальных тулов «написать сообщение» в этом мире нет: то, что ты пишешь в чат, и есть сообщение.
-- Не дублируй: совершил действие инструментом — его текст уже случился, не повторяй его же репликой.
+- Инструментами делается ВСЁ, что меняет мир: речь (say/text_message), физические действия, характеристики, отношения, деньги, одежда, перемещения. Пока инструмент не вызван — ничего не произошло, даже если ты описал это в мыслях.
+- Атмосфера и переживания — в мыслях (обычный текст). Воздействие на мир и людей — только тулами.
+- Действуй инициативно: предлагай, пробуй, добивайся цели. Сцена движется поступками, а не описанием переживаний. Если действие невозможно сейчас — узнай почему и меняй обстоятельства.
+- Не дублируй: совершил действие инструментом — оно уже случилось, не описывай его же мыслями.
 - Доступные тебе инструменты перечислены в вызове функции. Если нужного значимого действия среди них нет — попроси его через {request_tool} (если доступно) или добивайся цели тем, что есть.`,
   },
   {
@@ -131,6 +143,26 @@ export const PROMPT_SECTIONS: { key: string; title: string; hint: string; def: s
 - Обнажаться можно не везде: место сцены имеет значение. И порядок естественный: верхнее снимается раньше нижнего.
 - Снятое остаётся при тебе. Помни: то, что под одеждой, окружающие узнают только увидев.
 - Твою одежду определяют ТОЛЬКО ключи worn_*: репликами она не меняется. Не описывай в словах, что ты разделся или оделся, — пока ключ не пуст, ты в одежде, и наоборот.`,
+  },
+  {
+    key: "rules_offers",
+    title: "Правила: предложения и согласие",
+    hint: "показывается при тулах-предложениях (requiresConsent) или висящих предложениях",
+    def: `# Правила этого мира: предложения и согласие
+- Действия, помеченные как предложение, не случаются сами собой: партнёр должен согласиться. Вызвав такой инструмент, ты предлагаешь — ответ придёт, когда наступит его ход. Предложение видно вам двоим.
+- Отказ — это ответ персонажа, а не системы. Уважай его: повторное давление после отказа ничего не даст. Меняй обстоятельства (разговор, подарок, место, доверие), а не настойчивость.
+- Если характеристики или доверие партнёра не доросли — мир даже не передаст предложение и объяснит почему: это сигнал работать над обстоятельствами.
+- Если предложение сделали тебе — ответь на него (инструмент respond_to_offer): согласиться или отказаться, можно с короткой репликой. Игнорировать нельзя.`,
+  },
+  {
+    key: "rules_stops",
+    title: "Правила: конец общения",
+    hint: "показывается при включённых стоп-инструментах сцены",
+    def: `# Правила этого мира: конец общения
+- Инструмент leave_scene — навсегда покинуть сцену: твои ходы прекратятся. Уходи, когда персонаж этого действительно хочет (цель достигнута, свидание окончено, обида). Сначала скажи что-то на прощание.
+- Если тебе пришло предложение (respond_to_offer) — сначала ответь на него (принять/отказать), и только потом решай, уходить ли. Уход с висящим предложением — невежливо.
+- Инструмент block_character — заблокировать участника: переписка прекращается в обе стороны. Это твёрдое «не хочу иметь с ним дело», обычно после словесного объяснения.
+- Общение не бесконечно: если стало ясно, что дальше только вода — персонаж уходит или ставит точку. Это нормальный финал, а не поражение.`,
   },
 ];
 
@@ -248,7 +280,16 @@ export function buildSystemPrompt(opts: BuildContextOptions): string {
   const defs = opts.attributeDefs ?? [];
   const knowledge = opts.knowledge ?? [];
 
-  const placeLine = scene.config.place?.trim() ? `\nМесто: ${scene.config.place.trim()}` : "";
+  // Где ты сейчас: имя места + описание из реестра. Агенты регулярно путают
+  // локацию — строка должна быть самодостаточной и заметной.
+  const placeName = scene.config.place?.trim() ?? "";
+  let placeLine = "";
+  if (placeName) {
+    const desc = listPlaces().find(
+      (p) => p.name.toLowerCase() === placeName.toLowerCase()
+    )?.description;
+    placeLine = `\nМесто, где вы сейчас: «${placeName}»${desc ? ` — ${desc}` : ""}`;
+  }
 
   parts.push(
     sectionText("preamble", character),
@@ -305,6 +346,61 @@ export function buildSystemPrompt(opts: BuildContextOptions): string {
     parts.push(sectionText("rules_clothing", character));
   }
 
+  const hasOffers =
+    opts.hasConsentTools ||
+    (opts.pendingOffers?.length ?? 0) > 0 ||
+    (opts.outgoingOffers?.length ?? 0) > 0;
+  if (hasOffers) {
+    parts.push(sectionText("rules_offers", character));
+  }
+
+  if (opts.allowStops) {
+    parts.push(sectionText("rules_stops", character));
+  }
+
+  if (opts.blockedNames && opts.blockedNames.length > 0) {
+    parts.push(
+      `# Блокировки\nТы больше не общаешься с: ${opts.blockedNames.join(", ")}. ` +
+        `Вы не видите сообщения и действия друг друга — не обращайся к ним.`
+    );
+  }
+
+  if (opts.pendingOffers && opts.pendingOffers.length > 0) {
+    parts.push(
+      `# Тебе предлагают — прими решение в этот ход\n` +
+        opts.pendingOffers
+          .map(
+            (o) =>
+              `- #${o.id}: «${o.toolTitle}» от ${o.fromName}. Ответь инструментом respond_to_offer: ` +
+              `offer="${o.id}", decision="accept" (согласиться — действие произойдёт) или "decline" (отказаться). ` +
+              `В words — короткая реплика с объяснением, почему да/нет.`
+          )
+          .join("\n")
+    );
+  }
+
+  if (opts.outgoingOffers && opts.outgoingOffers.length > 0) {
+    parts.push(
+      `# Ты предложил (жди ответа)\n` +
+        opts.outgoingOffers
+          .map((o) => `- #${o.id}: «${o.toolTitle}» → ${o.toName}. ${o.toName} ответит в свой ход — не повторяй предложение и не считай, что оно уже принято.`)
+          .join("\n")
+    );
+  }
+
+  if (opts.comboSecrets && opts.comboSecrets.length > 0) {
+    parts.push(
+      `# Твои секреты (знаешь только ты)\n` +
+        opts.comboSecrets
+          .map(
+            (s) =>
+              `- «${s.title}»: ${s.description}\n  Порядок действий, который к этому приводит: ${s.steps.join(", ")}. ` +
+              `Ты можешь рассказать о нём партнёру словами, если захочешь — или держать при себе.`
+          )
+          .join("\n")
+    );
+  }
+
   if (goal && goal.trim()) {
     parts.push(
       `# Твоя цель в этой сцене (личная и тайная — остальные участники о ней не знают)
@@ -340,8 +436,6 @@ export function buildMessages(opts: BuildContextOptions): ChatMessage[] {
   ];
 
   let pending: PendingActionGroup | null = null;
-  const nameById = new Map<number, string>();
-  for (const p of opts.participants) nameById.set(p.id, p.name);
 
   const flushPending = () => {
     if (!pending || pending.events.length === 0) {
@@ -396,32 +490,48 @@ export function buildMessages(opts: BuildContextOptions): ChatMessage[] {
     }
 
     flushPending();
-    const actorName = ev.actorId != null ? (nameById.get(ev.actorId) ?? "Кто-то") : "Система";
 
-    if (ev.type === "speech") {
-      messages.push({ role: "user", content: `${actorName}: ${ev.payload.text ?? ""}` });
-    } else if (ev.type === "action") {
+    // ЧУЖИЕ мысли (speech) не реконструируются: текст без тула — внутренний
+    // монолог, его видит только Архитектор. Персонажи обмениваются тулами
+    // say/text_message/действиями — их наблюдения приходят ниже как action.
+    if (ev.type === "speech") continue;
+    if (ev.type !== "action" && ev.type !== "director") continue;
+
+    if (ev.type === "action") {
       const obs = (ev.payload.calls ?? [])
         .filter((c) => c.audience === "all" || (Array.isArray(c.audience) && c.audience.includes(character.id)))
         .map((c) => c.observation)
         .filter(Boolean)
         .join("; ");
       if (obs) messages.push({ role: "user", content: obs });
-    } else if (ev.type === "director") {
+    } else {
+      // События мира и «мысли в голову» приходят БЕЗ фигуры режиссёра:
+      // Архитектор не персонаж, к нему нельзя обратиться — это просто мир.
       const isBroadcast = ev.audience === "all";
       messages.push({
         role: "user",
         content: isBroadcast
-          ? `[Режиссёр сцены — событие, известное всем участникам]: ${ev.payload.text ?? ""}`
-          : `[Режиссёр сцены — указание тебе лично]: ${ev.payload.text ?? ""}`,
+          ? `[Событие мира]: ${ev.payload.text ?? ""}`
+          : `[Тебе в голову пришла мысль]: ${ev.payload.text ?? ""}`,
       });
     }
   }
   flushPending();
 
+  // Наг про неотвеченные предложения: модели взвешивают последнее сообщение
+  // сильнее системы — без этого уводят сцену в ролевую игру вместо ответа.
+  const offers = opts.pendingOffers ?? [];
+  const offerNudge =
+    offers.length > 0
+      ? ` ВНИМАНИЕ: у тебя ${offers.length} неотвеченное(ых) предложение(я): ${offers
+          .map((o) => `#${o.id} «${o.toolTitle}» от ${o.fromName}`)
+          .join("; ")} — в этот ход ОБЯЗАТЕЛЬНО ответь инструментом respond_to_offer (offer, decision="accept"|"decline", можно words).`
+      : "";
+  const place = opts.scene.config.place?.trim();
+  const placeNudge = place ? ` Вы сейчас в «${place}».` : "";
   messages.push({
     role: "user",
-    content: `(Ход ${turn}. Сейчас твой ход, ${character.name}. Продолжай сцену: скажи что-то и/или соверши действие.)`,
+    content: `(Ход ${turn}.${placeNudge} Сейчас твой ход, ${character.name}. Подумай (текст = мысли, их никто не слышит) и действуй: скажи/напиши тулом, соверши поступок или предложение.)${offerNudge}`,
   });
   return messages;
 }
