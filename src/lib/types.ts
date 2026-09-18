@@ -8,12 +8,20 @@ export type ProviderKind =
   | "openai-compatible"
   | "mock";
 
+/**
+ * Режим размышлений (thinking) для GLM/Z.AI-совместимых API: default —
+ * как решает провайдер (у GLM включён), off/max — явные переключатели
+ * (в тело запроса уходит thinking:{type:"disabled"|"enabled"}).
+ */
+export type ProviderThinkingMode = "default" | "off" | "max";
+
 export interface Provider {
   id: number;
   name: string;
   kind: ProviderKind;
   baseUrl: string;
   apiKey: string;
+  thinkingMode: ProviderThinkingMode;
   createdAt: string;
 }
 

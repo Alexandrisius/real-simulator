@@ -798,11 +798,13 @@ export interface AssistantTurnResult {
 const MAX_TOOL_ROUNDS = 8;
 
 /**
- * Бюджет токенов на ответ. Думающие модели (GLM 5.x и др.) тратят заметную
- * часть на reasoning_content ДО вызова инструментов: при 2048 ответ «умирал»
- * в рассуждениях — пустой content и ни одного tool call.
+ * Бюджет токенов на ответ: не жалеем. Думающие модели (GLM 5.x) тратят
+ * заметную часть на reasoning_content ДО вызова инструментов — ассистенту
+ * нужна точность настройки, поэтому размышления не глушим и даём простор
+ * (раньше при 2048–8192 ответ «умирал» в рассуждениях). Режим thinking
+ * управляется на провайдере: default (у GLM включён) / off / max.
  */
-const ASSISTANT_MAX_TOKENS = 8192;
+const ASSISTANT_MAX_TOKENS = 32768;
 
 export async function runAssistantTurn(input: {
   providerId: number;
@@ -831,10 +833,6 @@ export async function runAssistantTurn(input: {
       tools: ASSISTANT_TOOL_SPECS,
       temperature: 0.6,
       maxTokens: ASSISTANT_MAX_TOKENS,
-      // Думающие модели (GLM 5.x) на больших просьбах сжигают весь бюджет
-      // на reasoning и не выдают ни текста, ни tool-вызовов. Ассистенту
-      // глубокие рассуждения не нужны — выключаем, шаги и так в промпте.
-      extraBody: { thinking: { type: "disabled" } },
     });
     const msg = res.message;
     const calls = msg.tool_calls ?? [];

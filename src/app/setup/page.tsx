@@ -118,7 +118,10 @@ export default function SetupAssistantPage() {
       <Card className="mb-4 p-4">
         <div className="flex flex-wrap items-end gap-3">
           <div className="min-w-56">
-            <Field label="Провайдер ассистента">
+            <Field
+              label="Провайдер ассистента"
+              hint="Через него работает ассистент; его модель достаётся новым персонажам"
+            >
               <Dropdown
                 value={String(cfg?.providerId ?? "")}
                 options={[

@@ -60,6 +60,7 @@ function ensureSchemaLocked(db: DB): void {
       kind TEXT NOT NULL DEFAULT 'openai-compatible',
       base_url TEXT NOT NULL,
       api_key TEXT NOT NULL DEFAULT '',
+      thinking_mode TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL
     );
 
@@ -363,6 +364,7 @@ function ensureSchemaLocked(db: DB): void {
       created_at TEXT NOT NULL
     );
   `);
+  migrateProviders(db);
   migrateCharacters(db);
   migrateScenes(db);
   migrateSceneCharacters(db);
@@ -371,6 +373,16 @@ function ensureSchemaLocked(db: DB): void {
   migrateAttributes(db);
   migrateClothingSlots(db);
   migrateCombos(db);
+}
+
+/** Миграция старых баз: режим размышлений у провайдера (GLM/Z.AI thinking). */
+function migrateProviders(db: DB): void {
+  const cols = db.prepare("PRAGMA table_info(providers)").all() as unknown as {
+    name: string;
+  }[];
+  if (!cols.some((c) => c.name === "thinking_mode")) {
+    db.exec("ALTER TABLE providers ADD COLUMN thinking_mode TEXT NOT NULL DEFAULT ''");
+  }
 }
 
 /** Миграция старых баз: анонс срабатывания комбо («достижение» всем участникам). */

@@ -16,7 +16,7 @@ import {
   Toggle,
 } from "@/components/ui";
 import { api, apiDelete, apiPatch, apiPost } from "@/components/api";
-import type { Provider, ProviderKind } from "@/lib/types";
+import type { Provider, ProviderKind, ProviderThinkingMode } from "@/lib/types";
 
 const KIND_OPTIONS: { value: ProviderKind; label: string; hint: string; defaultUrl: string }[] = [
   {
@@ -40,7 +40,7 @@ const KIND_OPTIONS: { value: ProviderKind; label: string; hint: string; defaultU
   {
     value: "openai-compatible",
     label: "Другой OpenAI-совместимый",
-    hint: "llama.cpp, vLLM, Ollama (+openai), TabbyAPI и т.п.",
+    hint: "llama.cpp, vLLM, Ollama (+openai), TabbyAPI, Z.AI/GLM и т.п.",
     defaultUrl: "http://localhost:8080/v1",
   },
   {
@@ -51,13 +51,26 @@ const KIND_OPTIONS: { value: ProviderKind; label: string; hint: string; defaultU
   },
 ];
 
+const THINKING_OPTIONS = [
+  { value: "default", label: "по умолчанию провайдера" },
+  { value: "max", label: "включить по максимуму" },
+  { value: "off", label: "выключить" },
+];
+
 interface TestResult {
   ok: boolean;
   models: number;
   error?: string;
 }
 
-const emptyForm = { name: "", kind: "lmstudio" as ProviderKind, baseUrl: "", apiKey: "" };
+type ProviderForm = {
+  name: string;
+  kind: ProviderKind;
+  baseUrl: string;
+  apiKey: string;
+  thinkingMode: ProviderThinkingMode;
+};
+const emptyForm: ProviderForm = { name: "", kind: "lmstudio", baseUrl: "", apiKey: "", thinkingMode: "default" };
 
 export default function ProvidersPage() {
   const [providers, setProviders] = useState<Provider[]>([]);
@@ -105,7 +118,7 @@ export default function ProvidersPage() {
 
   const startEdit = (p: Provider) => {
     setEditingId(p.id);
-    setForm({ name: p.name, kind: p.kind, baseUrl: p.baseUrl, apiKey: p.apiKey });
+    setForm({ name: p.name, kind: p.kind, baseUrl: p.baseUrl, apiKey: p.apiKey, thinkingMode: p.thinkingMode ?? "default" });
     setFormOpen(true);
     requestAnimationFrame(() =>
       formRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
@@ -196,6 +209,16 @@ export default function ProvidersPage() {
                 options={KIND_OPTIONS.map((k) => ({ value: k.value, label: k.label }))}
               />
             </Field>
+            <Field
+              label="Размышления (thinking)"
+              hint="Для GLM/Z.AI-совместимых API: «по максимуму» — глубокие рассуждения (точнее, медленнее), «выключить» — мгновенные ответы. Другие API могут не знать этот параметр — оставляйте «по умолчанию»."
+            >
+              <Select
+                value={form.thinkingMode}
+                onChange={(v) => setForm({ ...form, thinkingMode: v as ProviderThinkingMode })}
+                options={THINKING_OPTIONS}
+              />
+            </Field>
             <Field label="Base URL" className="sm:col-span-2">
               <Input
                 value={form.baseUrl}
@@ -249,6 +272,9 @@ export default function ProvidersPage() {
                     <Badge color={p.kind === "mock" ? "warn" : "accent"}>
                       {KIND_OPTIONS.find((k) => k.value === p.kind)?.label ?? p.kind}
                     </Badge>
+                    {(p.thinkingMode === "off" || p.thinkingMode === "max") && (
+                      <Badge>{p.thinkingMode === "off" ? "💭 размышления выкл" : "💭 размышления макс"}</Badge>
+                    )}
                     {t && t !== "loading" &&
                       (t.ok ? (
                         <Badge color="ok">

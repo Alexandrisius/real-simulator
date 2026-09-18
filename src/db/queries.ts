@@ -27,6 +27,7 @@ import type {
   Place,
   Provider,
   ProviderKind,
+  ProviderThinkingMode,
   Scene,
   SceneBlock,
   SceneConfig,
@@ -68,6 +69,7 @@ interface ProviderRow {
   kind: string;
   base_url: string;
   api_key: string;
+  thinking_mode: string;
   created_at: string;
 }
 
@@ -78,6 +80,7 @@ function mapProvider(r: ProviderRow): Provider {
     kind: r.kind as ProviderKind,
     baseUrl: r.base_url,
     apiKey: r.api_key,
+    thinkingMode: r.thinking_mode === "off" || r.thinking_mode === "max" ? r.thinking_mode : "default",
     createdAt: r.created_at,
   };
 }
@@ -101,30 +104,38 @@ export function createProvider(data: {
   kind: ProviderKind;
   baseUrl: string;
   apiKey: string;
+  thinkingMode?: ProviderThinkingMode;
 }): Provider {
   const res = getDb()
     .prepare(
-      "INSERT INTO providers (name, kind, base_url, api_key, created_at) VALUES (?, ?, ?, ?, ?)"
+      "INSERT INTO providers (name, kind, base_url, api_key, thinking_mode, created_at) VALUES (?, ?, ?, ?, ?, ?)"
     )
-    .run(data.name, data.kind, data.baseUrl, data.apiKey, now());
+    .run(data.name, data.kind, data.baseUrl, data.apiKey, data.thinkingMode ?? "default", now());
   return getProvider(Number(res.lastInsertRowid))!;
 }
 
 export function updateProvider(
   id: number,
-  data: Partial<{ name: string; kind: ProviderKind; baseUrl: string; apiKey: string }>
+  data: Partial<{
+    name: string;
+    kind: ProviderKind;
+    baseUrl: string;
+    apiKey: string;
+    thinkingMode: ProviderThinkingMode;
+  }>
 ): Provider | null {
   const cur = getProvider(id);
   if (!cur) return null;
   getDb()
     .prepare(
-      "UPDATE providers SET name = ?, kind = ?, base_url = ?, api_key = ? WHERE id = ?"
+      "UPDATE providers SET name = ?, kind = ?, base_url = ?, api_key = ?, thinking_mode = ? WHERE id = ?"
     )
     .run(
       data.name ?? cur.name,
       data.kind ?? cur.kind,
       data.baseUrl ?? cur.baseUrl,
       data.apiKey ?? cur.apiKey,
+      data.thinkingMode ?? cur.thinkingMode,
       id
     );
   return getProvider(id);

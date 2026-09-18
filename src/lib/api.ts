@@ -10,6 +10,8 @@ export const providerSchema = z.object({
   kind: z.enum(["lmstudio", "openrouter", "opencode", "openai-compatible", "mock"]),
   baseUrl: z.string().min(1, "URL обязателен"),
   apiKey: z.string().optional().default(""),
+  /** Режим размышлений (GLM/Z.AI): default/off/max */
+  thinkingMode: z.enum(["default", "off", "max"]).optional().default("default"),
 });
 
 export const toolEffectSchema = z.object({

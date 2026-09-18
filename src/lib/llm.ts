@@ -160,6 +160,11 @@ export async function chatCompletion(opts: ChatOptions): Promise<CompletionResul
     max_tokens: opts.maxTokens ?? 1024,
     ...(opts.extraBody ?? {}),
   };
+  // Размышления (GLM/Z.AI-совместимые): явная настройка на провайдере.
+  // Параметр опционален у клиента и отправляется ТОЛЬКО при явном выборе,
+  // чтобы не ломать API, не знающие поля thinking.
+  if (opts.provider.thinkingMode === "off") body.thinking = { type: "disabled" };
+  else if (opts.provider.thinkingMode === "max") body.thinking = { type: "enabled" };
   if (opts.tools && opts.tools.length > 0) {
     body.tools = opts.tools.map((t) => ({
       type: "function",
