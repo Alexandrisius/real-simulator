@@ -38,6 +38,15 @@ before touching the engine, prompt assembly, or scoring.
   audience + target resolution, boundaries, state effects, money cost
   (deducts `state.money`, refuses when short); consent-gated tools branch
   here into offer creation
+- `src/lib/assistant.ts` — «Настроить с помощью ИИ»: setup assistant with
+  its OWN system prompt (helper, not a roleplay character). Not part of the
+  scene engine: `runAssistantTurn` loops function-calls over
+  `runAssistantAction` which writes entities straight to the DB (characters,
+  attributes, skills, clothing, garments, places, products, tools with
+  consent/cost/training, scenes, linear flow scenarios). Chat state lives on
+  the client; server config in settings `assistant.providerId`/`assistant.model`
+  (route `/api/assistant`, page `/setup`). Keep the assistant out of scene
+  visibility/prompt invariants — it never touches events or scenes' runtime
 - `src/lib/offers.ts` — offers/consent: a `requiresConsent` tool call creates
   an offer (table `offers`, TTL `OFFER_TTL_TURNS=6` turns) instead of
   executing; `respond_to_offer` accept executes the tool from the proposer
@@ -97,6 +106,8 @@ before touching the engine, prompt assembly, or scoring.
 - `src/app/api/` — REST + SSE routes (`/api/stream` is the SSE endpoint);
   flows: `/api/flows`, `/api/flows/[id]/runs`, `/api/flow-runs/[id]`,
   tool requests: `/api/tool-requests`, scene reset: `/api/scenes/[id]/reset`,
+  pending offers (for the live-room cards): `/api/scenes/[id]/offers`,
+  setup assistant: `/api/assistant` (GET/PUT config + POST chat),
   wardrobe: `/api/garments`, `/api/garments/[id]`, `/api/combos`,
   `/api/combos/[id]`, `/api/characters/[id]/wardrobe` (GET/POST),
   places registry: `/api/places` (+ `/api/places/[name]` PATCH = rename with

@@ -3843,6 +3843,91 @@ async function main() {
     assert(!row.editor_overlay || row.editor_overlay === "{}", "пересадка состава чистит оверлей");
   }
 
+  // =====================================================================
+  // Фаза N: ИИ-ассистент «Настроить с помощью ИИ» (действия мира)
+  // =====================================================================
+  {
+    const { runAssistantAction } = await import("../src/lib/assistant");
+    const { listFlows, getScene } = await import("../src/db/queries");
+    const ctx = { providerId: provider.id, model: "mock-actor" };
+    const act = (name: string, args: Record<string, unknown>) => {
+      try {
+        return runAssistantAction(name, args, ctx);
+      } catch (e) {
+        return { ok: false, summary: e instanceof Error ? e.message : String(e) };
+      }
+    };
+
+    const overview = act("world_overview", {});
+    assert(overview.ok && typeof overview.data === "object", "ассистент: обзор мира собирается");
+
+    const human = act("create_character", {
+      name: "Игрок Андрей",
+      persona: "Обычный парень, играет пользователь. Любит настолки.",
+      isHuman: true,
+      state: { money: 500 },
+    });
+    assert(human.ok, `ассистент: человек создан (${human.summary})`);
+
+    const ai = act("create_character", {
+      name: "Вика Ассист",
+      emoji: "💃",
+      persona: "Танцовщица, острая на язык, не доверяет быстро.",
+      toolNames: ["do_activity"],
+    });
+    assert(ai.ok, `ассистент: ИИ-персонаж создан (${ai.summary})`);
+
+    const dup = act("create_character", { name: "Игрок Андрей", persona: "Дубль дубль дубль дубль." });
+    assert(!dup.ok, "ассистент: дубликат персонажа отклонён");
+
+    const kiss = act("create_tool", {
+      name: "offer_dance",
+      title: "Пригласить на танец",
+      description: "Пригласить персонажа на танец.",
+      parameters: { type: "object", properties: { to: { type: "string" } }, required: ["to"] },
+      audience: "target",
+      targetParam: "to",
+      requiresConsent: true,
+      effects: [{ target: "tool_target", key: "mood", op: "add", value: 1 }],
+      assignTo: ["Вика Ассист"],
+    });
+    assert(kiss.ok, `ассистент: тул с согласием создан и назначен (${kiss.summary})`);
+
+    const badTool = act("create_tool", {
+      name: "no_target",
+      description: "адресный без targetParam",
+      audience: "target",
+    });
+    assert(!badTool.ok, "ассистент: адресный тул без targetParam отклонён");
+
+    const scene = act("create_scene", {
+      name: "Танцпол",
+      setting: "Танцпол: громкая музыка, огни, толпа.",
+      participantNames: ["Игрок Андрей", "Вика Ассист"],
+      goals: { "Вика Ассист": "Понравиться, но не показывать этого" },
+    });
+    assert(scene.ok, `ассистент: сцена создана (${scene.summary})`);
+
+    const scenario = act("create_scenario", {
+      name: "Вечер с Викой",
+      steps: [
+        {
+          title: "Знакомство у бара",
+          setting: "Бар: полумрак, коктейли.",
+          participantNames: ["Игрок Андрей", "Вика Ассист"],
+        },
+        { title: "Танцпол", setting: "Огни и басы, тела близко." },
+      ],
+    });
+    assert(scenario.ok, `ассистент: сценарий создан (${scenario.summary})`);
+    const flow = listFlows().find((f) => f.name === "Вечер с Викой")!;
+    assert(flow.graph.nodes.length === 3 && flow.graph.nodes[2].kind === "final", "сценарий: 2 сцены + финал");
+    const chainOk = flow.graph.edges.every((e, i) => e.from === `n${i + 1}`);
+    assert(chainOk && flow.graph.edges[flow.graph.edges.length - 1].to === "nfin", "сценарий: линейная цепочка в финал");
+    const step2scene = getScene(flow.graph.nodes[1].sceneId!)!;
+    assert(step2scene.name === "Танцпол (Вечер с Викой)" || step2scene.name === "Танцпол", "сценарий: сцены шагов созданы");
+  }
+
   console.log("\nE2E: все проверки пройдены ✅");
   process.exit(0);
 }

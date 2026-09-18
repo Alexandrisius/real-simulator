@@ -47,6 +47,28 @@ export default function DashboardPage() {
         subtitle="Локальный симулятор социальных ИИ-агентов: персонажи живут, общаются и действуют сами."
       />
 
+      {/* Пустая база пугает полями — главный вход для новичка: собрать мир с ассистентом */}
+      <Link href="/setup" className="block">
+        <Card
+          className={`mb-6 flex items-center gap-4 p-5 transition-colors hover:border-accent/50 ${
+            stats && stats.characters === 0 ? "border-accent/40 bg-accent/5" : ""
+          }`}
+        >
+          <span className="flex h-11 w-11 shrink-0 items-center justify-center rounded-full border border-accent/40 bg-accent/10">
+            <Sparkles className="h-5 w-5 text-accent" />
+          </span>
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-medium">Настроить с помощью ИИ</div>
+            <p className="mt-0.5 text-xs leading-relaxed text-muted">
+              {stats && stats.characters === 0
+                ? "Мир пока пуст — опишите идею, и ассистент создаст персонажей, инструменты и первую сцену за вас."
+                : "Опишите идею — ассистент дополнит мир: новые персонажи, инструменты, сценарии."}
+            </p>
+          </div>
+          <ArrowRight className="h-4 w-4 shrink-0 text-muted/40" />
+        </Card>
+      </Link>
+
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         {cards.map((c) => (
           <Link key={c.href} href={c.href}>
