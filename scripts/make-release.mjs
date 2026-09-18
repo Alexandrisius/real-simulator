@@ -71,6 +71,14 @@ cpSync(path.join(root, ".next", "static"), path.join(app, ".next", "static"), { 
 if (existsSync(path.join(root, "public"))) {
   cpSync(path.join(root, "public"), path.join(app, "public"), { recursive: true });
 }
+// КРИТИЧНО: файловый трейсинг Next тянет за dynamic new DatabaseSync() живую
+// базу репозитория (data/app.db с реальными API-ключами) в standalone-копию.
+// Публиковать её нельзя — вычищаем, на целевом ПК БД создаётся с нуля.
+const leakedData = path.join(app, "data");
+if (existsSync(leakedData)) {
+  rmSync(leakedData, { recursive: true, force: true });
+  console.log("      вычищена притащенная трейсером data/ (живая БД не попадает в релиз)");
+}
 
 console.log("3/6  Загружаю Node.js runtime (кэш: .release-cache)…");
 const nodeMajor = Number(process.versions.node.split(".")[0]);
@@ -130,10 +138,14 @@ async function ensureNodeRuntime(major) {
   }
   // В архиве папка node-vX.Y.Z-win-x64/ — забираем только node.exe
   // (стандартная библиотека Node вшита в exe, остальное не нужно).
+  // Распаковка через PowerShell: GNU tar из Git Bash считает «D:» именем хоста.
   const tmp = path.join(cache, `extract-${ver}`);
   rmSync(tmp, { recursive: true, force: true });
   mkdirSync(tmp, { recursive: true });
-  execSync(`tar -xf "${zip}" -C "${tmp}"`, { stdio: "inherit" });
+  execSync(
+    `powershell -NoProfile -Command "Expand-Archive -Path '${zip.replace(/'/g, "''")}' -DestinationPath '${tmp.replace(/'/g, "''")}' -Force"`,
+    { stdio: "inherit" }
+  );
   const inner = path.join(tmp, `node-v${ver}-win-x64`, "node.exe");
   if (!existsSync(inner)) die(`в архиве Node ${ver} нет node.exe`);
   cpSync(inner, exe);

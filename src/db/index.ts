@@ -38,6 +38,21 @@ function createDb(): DB {
 }
 
 export function ensureSchema(db: DB): void {
+  // Эксклюзивная транзакция: воркеры next build открывают одну БД параллельно,
+  // и без сериализации два воркера успевают увидеть «колонки нет» и оба
+  // выполнить ALTER TABLE ADD COLUMN → «duplicate column name». BEGIN IMMEDIATE
+  // + busy_timeout выстраивают их в очередь: второй увидит уже готовую схему.
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    ensureSchemaLocked(db);
+    db.exec("COMMIT");
+  } catch (e) {
+    db.exec("ROLLBACK");
+    throw e;
+  }
+}
+
+function ensureSchemaLocked(db: DB): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS providers (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
