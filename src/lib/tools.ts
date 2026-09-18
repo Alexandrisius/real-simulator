@@ -561,6 +561,22 @@ export function executeTool(input: ToolExecInput): ToolExecResult {
       turn: input.turn ?? 0,
     });
   }
+  // Согласие без адресата не имеет смысла (кривой тул, напр. из заявки
+  // агента с audience != "target"): исполнять такое молча — обход
+  // согласия. Отказываем с внятной причиной — пусть просят починку.
+  if (tool.requiresConsent && tool.audience !== "target" && !input.skipConsent && input.scene != null) {
+    return {
+      ok: false,
+      result:
+        `Инструмент «${tool.title || tool.name}» помечен как требующий согласия, но не адресный ` +
+        `(audience="${tool.audience}") — это ошибка конфигурации. Действие отменено; ` +
+        `попроси Архитектора исправить тул (адресный + параметр получателя).`,
+      observation: "",
+      audience: "none",
+      stateChanges: [],
+      relationChanges: [],
+    };
+  }
 
   // Эффекты: state — через карту состояний (один write на цель),
   // relation — отдельным блоком с множителем химии пары,

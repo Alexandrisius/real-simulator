@@ -495,7 +495,7 @@ export function runAssistantAction(
         providerId: d.isHuman ? null : ctx.providerId,
         model: d.isHuman ? "" : d.model?.trim() || ctx.model,
         temperature: 0.8,
-        maxTokens: 2048,
+        maxTokens: 4096,
         toolIds,
         state: d.state ?? {},
         isHuman: d.isHuman ?? false,
@@ -640,15 +640,32 @@ export function runAssistantAction(
       const targetParam = d.targetParam?.trim() || null;
       if (d.audience === "target" && !targetParam)
         throw new Error("адресному тулу нужен targetParam (и параметр с этим именем в схеме)");
+
+      // Авторемонт схемы: ассистенты любят забывать параметр-получателя.
+      // Без него движок не разрешает цель: наблюдения с {to} рендерятся
+      // литералом, эффекты tool_target не применяются, consent-тулы
+      // становятся бессмысленными. Чиним: параметр + required + audience.
+      const schema: Record<string, unknown> =
+        d.parameters && (d.parameters as { type?: string }).type
+          ? { ...d.parameters }
+          : { type: "object", properties: {} };
+      if (targetParam) {
+        const props = { ...((schema.properties as Record<string, unknown>) ?? {}) };
+        if (!props[targetParam] || typeof props[targetParam] !== "object") {
+          props[targetParam] = { type: "string", description: "Имя персонажа-получателя" };
+        }
+        schema.properties = props;
+        const req = new Set([...((schema.required as string[]) ?? []), targetParam]);
+        schema.required = [...req];
+      }
+      const audience = targetParam ? "target" : d.audience ?? "all";
+
       const t = createTool({
         name: d.name,
         title: d.title ?? "",
         description: d.description ?? "",
-        parametersSchema:
-          d.parameters && (d.parameters as { type?: string }).type
-            ? d.parameters
-            : { type: "object", properties: {} },
-        audience: d.audience ?? "all",
+        parametersSchema: schema,
+        audience,
         targetParam,
         observationTemplate: d.observationTemplate ?? "{name} применяет {tool}",
         effects: (d.effects ?? []) as unknown as ToolEffect[],
@@ -780,6 +797,13 @@ export interface AssistantTurnResult {
 /** Максимум раундов «вызов инструментов → результаты» на одно сообщение. */
 const MAX_TOOL_ROUNDS = 8;
 
+/**
+ * Бюджет токенов на ответ. Думающие модели (GLM 5.x и др.) тратят заметную
+ * часть на reasoning_content ДО вызова инструментов: при 2048 ответ «умирал»
+ * в рассуждениях — пустой content и ни одного tool call.
+ */
+const ASSISTANT_MAX_TOKENS = 8192;
+
 export async function runAssistantTurn(input: {
   providerId: number;
   model: string;
@@ -798,6 +822,7 @@ export async function runAssistantTurn(input: {
   ];
 
   const actions: AssistantActionInfo[] = [];
+  let nudged = false;
   for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
     const res = await chatCompletion({
       provider,
@@ -805,12 +830,28 @@ export async function runAssistantTurn(input: {
       messages,
       tools: ASSISTANT_TOOL_SPECS,
       temperature: 0.6,
-      maxTokens: 2048,
+      maxTokens: ASSISTANT_MAX_TOKENS,
+      // Думающие модели (GLM 5.x) на больших просьбах сжигают весь бюджет
+      // на reasoning и не выдают ни текста, ни tool-вызовов. Ассистенту
+      // глубокие рассуждения не нужны — выключаем, шаги и так в промпте.
+      extraBody: { thinking: { type: "disabled" } },
     });
     const msg = res.message;
     const calls = msg.tool_calls ?? [];
     if (calls.length === 0) {
-      return { reply: (msg.content ?? "").trim() || "(ассистент промолчал)", actions };
+      const text = (msg.content ?? "").trim();
+      if (text) return { reply: text, actions };
+      // Пустой ответ без действий (обрыв генерации у думающей модели) —
+      // один раз подталкиваем и даём ещё попытку.
+      if (!nudged) {
+        nudged = true;
+        messages.push({
+          role: "user",
+          content: "(Ответ оказался пуст. Продолжай: вызови нужные инструменты или ответь текстом.)",
+        });
+        continue;
+      }
+      return { reply: "(ассистент не смог ответить — попробуйте переформулировать)", actions };
     }
     messages.push({ role: "assistant", content: msg.content ?? null, tool_calls: calls });
     for (const c of calls) {

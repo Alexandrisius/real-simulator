@@ -77,6 +77,12 @@ export interface ChatOptions {
    * требуют заголовок x-opencode-session для маршрутизации и кэша промптов.
    */
   sessionId?: string;
+  /**
+   * Доп. поля в тело запроса (провайдер-специфичные переключатели).
+   * Пример: thinking:{type:"disabled"} у GLM 5.x — без него думающая
+   * модель может спалить весь max_tokens на reasoning_content.
+   */
+  extraBody?: Record<string, unknown>;
 }
 
 function normalizeBase(baseUrl: string): string {
@@ -152,6 +158,7 @@ export async function chatCompletion(opts: ChatOptions): Promise<CompletionResul
     messages: opts.messages,
     temperature: opts.temperature ?? 0.8,
     max_tokens: opts.maxTokens ?? 1024,
+    ...(opts.extraBody ?? {}),
   };
   if (opts.tools && opts.tools.length > 0) {
     body.tools = opts.tools.map((t) => ({
