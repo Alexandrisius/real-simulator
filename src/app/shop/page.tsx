@@ -17,6 +17,7 @@ import {
 } from "@/components/ui";
 import { Combobox } from "@/components/Combobox";
 import { api, apiDelete, apiPatch, apiPost } from "@/components/api";
+import { EmojiPicker } from "@/components/EmojiPicker";
 import type { AttributeDef, ClothingSlot, ShopProduct, ToolEffect } from "@/lib/types";
 
 interface FormState {
@@ -81,7 +82,13 @@ export default function ShopPage() {
     return opts;
   }, [attributes]);
 
-  const startCreate = () => {
+  /** Красивое имя характеристики для карточек: «😊 Настроение», а не «mood». */
+const attrName = (key: string) => {
+  const a = attributes.find((x) => x.key === key);
+  return a ? `${a.emoji ? a.emoji + " " : ""}${a.label}` : key;
+};
+
+const startCreate = () => {
     setForm(emptyForm);
     setEditingId(null);
     setOpen(true);
@@ -188,11 +195,9 @@ export default function ShopPage() {
               />
             </Field>
             <Field label="Эмодзи">
-              <Input
-                value={form.emoji}
-                onChange={(e) => setForm({ ...form, emoji: e.target.value })}
-                className="w-20 text-center text-lg"
-              />
+              <div className="w-36">
+                <EmojiPicker value={form.emoji} onChange={(v) => setForm({ ...form, emoji: v })} />
+              </div>
             </Field>
             <Field
               label="Категория"
@@ -309,7 +314,7 @@ export default function ShopPage() {
                       const num = Number(v);
                       setEffect(i, { value: v !== "" && !Number.isNaN(num) ? num : v });
                     }}
-                    placeholder="1"
+                    placeholder="±1"
                   />
                 </div>
                 <IconBtn
@@ -373,7 +378,7 @@ export default function ShopPage() {
                                     : e.target === "relation"
                                       ? "отношение получателя"
                                       : "получателю"
-                                }.${e.key} ${
+                                }.${attrName(e.key)} ${
                                   e.op === "add" ? "+=" : "="
                                 } ${JSON.stringify(e.value)}`
                             )

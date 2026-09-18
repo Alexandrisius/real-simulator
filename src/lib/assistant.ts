@@ -8,7 +8,15 @@
 // на клиенте и присылается с каждым запросом — сервер stateless.
 
 import { z } from "zod";
-import type { Boundary, ChatMessage, FlowNode, ToolEffect, ToolSpec } from "./types";
+import type {
+  Boundary,
+  ChatMessage,
+  FlowNode,
+  OutcomeCondition,
+  ToolEffect,
+  ToolOutcome,
+  ToolSpec,
+} from "./types";
 import { chatCompletion } from "./llm";
 import { boundarySchema, toolEffectSchema } from "@/lib/api";
 import {
@@ -16,6 +24,7 @@ import {
   createAttribute,
   createCharacter,
   createClothingSlot,
+  createCombo,
   createFlow,
   createGarment,
   createPlace,
@@ -27,6 +36,7 @@ import {
   getProvider,
   listAttributes,
   listCharacters,
+  listCombos,
   listClothingSlots,
   listFlows,
   listGarments,
@@ -34,6 +44,7 @@ import {
   listProducts,
   listScenes,
   listSkills,
+  setChemistry,
   listTools,
   updateCharacter,
 } from "@/db/queries";
@@ -70,6 +81,8 @@ export const ASSISTANT_SYSTEM_PROMPT = `Ты — «Ассистент Архит
 - Адресный тул (audience="target") обязан иметь targetParam — имя параметра с получателем, а этот параметр — в схеме.
 - Эффект: {"target":"self"|"tool_target"|"relation"|"chemistry","key":ключ,"op":"add"|"set","value":число}. relation/chemistry — только у тулов с получателем.
 - Личное и интимное — requiresConsent: true (у тула появится цикл предложение→ответ).
+- Эффекты бывают отрицательными: value: -1 уменьшает характеристику (испорченный подарок, дорогая покупка, «не то» исход — mood −1).
+- Хорошая практика: у значимых тулов делай исходы «успех/не то» по навыку и отношению — мир сам варьирует результат.
 - Ошибка валидации вернёт список проблем — исправь аргументы и вызови инструмент снова.
 - Персонажу без явной модели достанется модель ассистента; если пользователь хочет другие — спроси какие.`;
 
@@ -144,6 +157,22 @@ const createSkillSchema = z.object({
   practicePerLevel: z.number().int().min(1).max(100).optional(),
 });
 
+const outcomeCondAssistantSchema = z.object({
+  kind: z.enum(["actor_attr", "target_attr", "relation", "place", "worn", "chemistry"]),
+  key: z.string().optional().default(""),
+  op: z.enum([">=", "<", "="]).optional().default(">="),
+  value: z.union([z.number(), z.string()]).optional().default(0),
+});
+
+const outcomeAssistantSchema = z.object({
+  id: z.string().regex(/^[a-z0-9_-]{1,40}$/i, "id: латиница/цифры").optional(),
+  title: z.string().min(1).max(60),
+  conditions: z.array(outcomeCondAssistantSchema).min(1, "исходу нужно хотя бы одно условие"),
+  effects: z.array(effectSchema).optional().default([]),
+  noticeTarget: z.string().max(300).optional().default(""),
+  hideFromPrompt: z.boolean().optional().default(false),
+});
+
 const createToolSchema = z.object({
   name: z.string().regex(/^[a-z0-9_]{2,64}$/, "имя: a-z, 0-9, _, 2-64 символа"),
   title: z.string().max(60).optional(),
@@ -156,7 +185,34 @@ const createToolSchema = z.object({
   cost: z.number().min(0).optional(),
   requiresConsent: z.boolean().optional(),
   trainsSkill: z.string().optional(),
+  outcomes: z.array(outcomeAssistantSchema).optional(),
+  declineEffects: z.array(effectSchema).optional(),
   assignTo: z.array(z.string()).optional(),
+});
+
+const createComboSchema = z.object({
+  name: z.string().regex(/^[a-z0-9_-]{2,64}$/, "имя: a-z, 0-9, _, -"),
+  title: z.string().min(1).max(80),
+  description: z.string().max(500).optional(),
+  steps: z
+    .array(
+      z.object({
+        toolName: z.string(),
+        actorName: z.string().optional(),
+        targetName: z.string().optional(),
+      })
+    )
+    .min(2, "комбо — минимум 2 шага"),
+  windowTurns: z.number().int().min(2).max(200).optional(),
+  effects: z.array(effectSchema).optional(),
+  knowers: z.array(z.string()).optional(),
+  announce: z.boolean().optional(),
+});
+
+const setChemistrySchema = z.object({
+  a: z.string(),
+  b: z.string(),
+  value: z.number().int().min(-3).max(3),
 });
 
 const createSceneSchema = z.object({
@@ -340,9 +396,61 @@ export const ASSISTANT_TOOL_SPECS: ToolSpec[] = [
         cost: { type: "number", description: "Цена $ (0 = бесплатно)" },
         requiresConsent: { type: "boolean", description: "Сначала предложение, действие — после согласия цели" },
         trainsSkill: str("Ключ навыка, который качает успешное применение"),
+        outcomes: {
+          type: "array",
+          description:
+            "Исходы: условия («И») по ИСТИННЫМ значениям → эффекты поверх базовых + личная заметка цели. Проверяются по порядку, побеждает первый подошедший. Условие: {kind: 'actor_attr'|'target_attr'|'relation'|'place'|'worn'|'chemistry', key (для attr/worn), op: '>='|'<'|'=', value}",
+          items: { type: "object", additionalProperties: true },
+        },
+        declineEffects: { type: "array", description: "Эффекты при ОТКАЗЕ от предложения (на отказывающегося)", items: { type: "object", additionalProperties: true } },
         assignTo: { type: "array", items: { type: "string" }, description: "Имена персонажей" },
       },
       required: ["name", "description"],
+    },
+  },
+  {
+    name: "create_combo",
+    description:
+      "Комбо: скрытая цепочка успешных вызовов в точном порядке (окно windowTurns ходов) даёт неожиданный эффект. Рецепт видят только knowers; пусто — секретное достижение, не знает никто. announce — объявить всем, когда сработало.",
+    parameters: {
+      type: "object",
+      properties: {
+        name: str("Имя латиницей, напр. romantic_dinner"),
+        title: str("Название по-русски"),
+        description: str("Что происходит при срабатывании"),
+        steps: {
+          type: "array",
+          description: "Последовательность вызовов (исполненных, предложения — не в счёт), минимум 2",
+          items: {
+            type: "object",
+            properties: {
+              toolName: str("Имя тула"),
+              actorName: str("Кто именно вызывает (необязательно)"),
+              targetName: str("На ком именно (необязательно)"),
+            },
+            required: ["toolName"],
+          },
+        },
+        windowTurns: { type: "number", description: "За сколько ходов нужна вся цепочка (по умолчанию 10)" },
+        effects: { type: "array", description: "Эффекты при срабатывании (с последним актёром/целью)", items: { type: "object", additionalProperties: true } },
+        knowers: { type: "array", items: { type: "string" }, description: "Имена персонажей, знающих рецепт" },
+        announce: { type: "boolean", description: "Объявить срабатывание всем участникам (по умолчанию да)" },
+      },
+      required: ["name", "title", "steps"],
+    },
+  },
+  {
+    name: "set_chemistry",
+    description:
+      "Химия пары (−3..+3): скрытый множитель ВСЕХ изменений отношений между двумя персонажами. Значения агентам не видны — только последствия. Задаёт врождённую искру или антипатию.",
+    parameters: {
+      type: "object",
+      properties: {
+        a: str("Имя первого"),
+        b: str("Имя второго"),
+        value: { type: "number", description: "От −3 (антипатия) до +3 (искра)" },
+      },
+      required: ["a", "b", "value"],
     },
   },
   {
@@ -673,6 +781,15 @@ export function runAssistantAction(
         origin: "manual",
         requiresConsent: d.requiresConsent ?? false,
         trainsSkill: d.trainsSkill?.replace(/^skill_/, "") ?? "",
+        outcomes: (d.outcomes ?? []).map((o, i) => ({
+          id: o.id?.trim() || `outcome_${i + 1}`,
+          title: o.title,
+          conditions: o.conditions as unknown as OutcomeCondition[],
+          effects: (o.effects ?? []) as unknown as ToolEffect[],
+          noticeTarget: o.noticeTarget ?? "",
+          hideFromPrompt: o.hideFromPrompt ?? false,
+        })) as ToolOutcome[],
+        declineEffects: (d.declineEffects ?? []) as unknown as ToolEffect[],
       });
       for (const who of d.assignTo ?? []) {
         const c = findCharacterByName(who);
@@ -681,7 +798,11 @@ export function runAssistantAction(
       }
       return {
         ok: true,
-        summary: `Тул создан: ${t.title || t.name}${d.requiresConsent ? " (по согласию)" : ""}${d.assignTo?.length ? `, назначен: ${d.assignTo.join(", ")}` : ""}`,
+        summary:
+          `Тул создан: ${t.title || t.name}` +
+          `${d.requiresConsent ? " (по согласию)" : ""}` +
+          `${(d.outcomes ?? []).length ? `, исходов: ${(d.outcomes ?? []).length}` : ""}` +
+          `${d.assignTo?.length ? `, назначен: ${d.assignTo.join(", ")}` : ""}`,
       };
     }
 
@@ -773,6 +894,65 @@ export function runAssistantAction(
       return {
         ok: true,
         summary: `Сценарий создан: «${flow.name}» — ${createdSceneNames.join(" → ")} → финал. Раздел «Сценарии» → прогон`,
+      };
+    }
+
+    case "create_combo": {
+      const p = createComboSchema.safeParse(rawArgs);
+      if (!p.success) throw new Error(zerr(p.error));
+      const d = p.data;
+      if (listCombos().some((c) => c.name === d.name)) throw new Error(`Комбо «${d.name}» уже есть`);
+      const tools = listTools();
+      const chars = listCharacters();
+      const steps = d.steps.map((st) => {
+        if (!tools.some((t) => t.name === st.toolName))
+          throw new Error(`Тула «${st.toolName}» нет. Есть: ${tools.map((t) => t.name).join(", ")}`);
+        for (const who of [st.actorName, st.targetName]) {
+          if (who && !chars.some((c) => c.name.toLowerCase() === who.trim().toLowerCase()))
+            throw new Error(`Персонаж «${who}» не найден`);
+        }
+        return {
+          toolName: st.toolName,
+          actorName: st.actorName?.trim() || undefined,
+          targetName: st.targetName?.trim() || undefined,
+        };
+      });
+      const knowers = (d.knowers ?? []).map((n) => {
+        const c = chars.find((x) => x.name.toLowerCase() === n.trim().toLowerCase());
+        if (!c) throw new Error(`Персонаж «${n}» (knowers) не найден`);
+        return c.id;
+      });
+      const combo = createCombo({
+        name: d.name,
+        title: d.title,
+        description: d.description ?? "",
+        steps: steps as never,
+        windowTurns: d.windowTurns ?? 10,
+        effects: (d.effects ?? []) as unknown as ToolEffect[],
+        knowers,
+        announce: d.announce ?? true,
+      });
+      return {
+        ok: true,
+        summary:
+          `Комбо создано: «${combo.title}» (${d.steps.map((x) => x.toolName).join(" → ")})` +
+          `${knowers.length ? `, рецепт знают: ${d.knowers!.join(", ")}` : " — секретное достижение (рецепт не знает никто)"}`,
+      };
+    }
+
+    case "set_chemistry": {
+      const p = setChemistrySchema.safeParse(rawArgs);
+      if (!p.success) throw new Error(zerr(p.error));
+      const d = p.data;
+      const a = findCharacterByName(d.a);
+      const b = findCharacterByName(d.b);
+      if (!a) throw new Error(`Персонаж «${d.a}» не найден`);
+      if (!b) throw new Error(`Персонаж «${d.b}» не найден`);
+      if (a.id === b.id) throw new Error("химия задаётся паре разных персонажей");
+      setChemistry(a.id, b.id, d.value);
+      return {
+        ok: true,
+        summary: `Химия пары ${a.name} ↔ ${b.name}: ${d.value > 0 ? "+" : ""}${d.value} (усиливает отношения пары; агентам не видна)`,
       };
     }
 

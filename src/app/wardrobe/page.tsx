@@ -16,6 +16,7 @@ import {
   Textarea,
 } from "@/components/ui";
 import { api, apiDelete, apiPatch, apiPost } from "@/components/api";
+import { EmojiPicker } from "@/components/EmojiPicker";
 import type { AttributeDef, Character, ClothingSlot, Garment, ToolEffect } from "@/lib/types";
 
 /** Слот в виде гардероба персонажа: что надето и какой предмет в нём. */
@@ -111,7 +112,13 @@ export default function WardrobePage() {
     [attributes]
   );
 
-  const startCreate = () => {
+  /** Красивое имя характеристики для карточек: «😊 Настроение», а не «mood». */
+const attrName = (key: string) => {
+  const a = attributes.find((x) => x.key === key);
+  return a ? `${a.emoji ? a.emoji + " " : ""}${a.label}` : key;
+};
+
+const startCreate = () => {
     setForm(emptyForm);
     setEditingId(null);
     setOpen(true);
@@ -232,11 +239,9 @@ export default function WardrobePage() {
               />
             </Field>
             <Field label="Эмодзи">
-              <Input
-                value={form.emoji}
-                onChange={(e) => setForm({ ...form, emoji: e.target.value })}
-                className="w-20 text-center text-lg"
-              />
+              <div className="w-36">
+                <EmojiPicker value={form.emoji} onChange={(v) => setForm({ ...form, emoji: v })} />
+              </div>
             </Field>
             <Field
               label="Слот одежды"
@@ -336,7 +341,7 @@ export default function WardrobePage() {
                       const num = Number(v);
                       setEffect(i, { value: v !== "" && !Number.isNaN(num) ? num : v });
                     }}
-                    placeholder="1"
+                    placeholder="±1"
                   />
                 </div>
                 <IconBtn
@@ -399,7 +404,7 @@ export default function WardrobePage() {
                       {g.effects.length > 0 && (
                         <div className="mt-2 border-t border-line pt-2 text-xs text-muted">
                           {g.effects
-                            .map((e) => `${e.key} ${e.op === "add" ? "+" : "="} ${fmtValue(e.value)}`)
+                            .map((e) => `${attrName(e.key)} ${e.op === "add" ? "+" : "="} ${fmtValue(e.value)}`)
                             .join("; ")}
                         </div>
                       )}

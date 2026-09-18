@@ -17,6 +17,7 @@ import {
   Select,
 } from "@/components/ui";
 import { api, apiDelete, apiPatch, apiPost } from "@/components/api";
+import { EmojiPicker } from "@/components/EmojiPicker";
 import type { AttributeDef, ClothingSlot, Place, ToolEffect } from "@/lib/types";
 
 interface FormState {
@@ -347,11 +348,9 @@ export default function AttributesPage() {
               />
             </Field>
             <Field label="Эмодзи">
-              <Input
-                value={form.emoji}
-                onChange={(e) => setForm({ ...form, emoji: e.target.value })}
-                className="w-20 text-center text-lg"
-              />
+              <div className="w-36">
+                <EmojiPicker value={form.emoji} onChange={(v) => setForm({ ...form, emoji: v })} />
+              </div>
             </Field>
             <Field label="Тип">
               <Select

@@ -16,6 +16,7 @@ import {
   Textarea,
 } from "@/components/ui";
 import { api, apiDelete, apiPatch, apiPost } from "@/components/api";
+import { EmojiPicker } from "@/components/EmojiPicker";
 import { Combobox } from "@/components/Combobox";
 import type {
   AttributeDef,
@@ -28,11 +29,6 @@ import type {
   ToolEffect,
 } from "@/lib/types";
 import { CARRIED_PREFIX, WORN_PREFIX } from "@/lib/types";
-
-const EMOJIS = [
-  "👩","👨","🧑","👧","👦","👵","👴","🧓","🦊","🐱","🐺","🦉","🌸","🔥","🌙","⭐",
-  "🎧","🎮","☕","🍷","📚","💼","🏡","🚗","💎","👑","🎭","🖤","💜","😄","😎","🥲",
-];
 
 const PERSONA_PLACEHOLDER = `Характер, манера речи, привычки, цели и отношение к другим. Например:
 
@@ -721,18 +717,7 @@ export default function CharacterEditorPage({
           </Field>
           <Field label="Аватар">
             <div className="flex flex-wrap gap-1">
-              {EMOJIS.map((e) => (
-                <button
-                  key={e}
-                  type="button"
-                  onClick={() => setForm({ ...form, emoji: e })}
-                  className={`h-8 w-8 rounded-lg text-lg leading-none transition-colors ${
-                    form.emoji === e ? "bg-accent/25 ring-1 ring-accent" : "hover:bg-panel-2"
-                  }`}
-                >
-                  {e}
-                </button>
-              ))}
+<EmojiPicker value={form.emoji} onChange={(v) => setForm({ ...form, emoji: v })} />
             </div>
           </Field>
           <Field

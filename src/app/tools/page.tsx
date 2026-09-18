@@ -339,6 +339,11 @@ export default function ToolsPage() {
     value: a.key,
     label: `${a.emoji ? a.emoji + " " : ""}${a.label} (${a.key})`,
   }));
+  /** Красивое имя характеристики для карточек: «😊 Настроение», а не «mood». */
+  const attrName = (key: string) => {
+    const a = attributes.find((x) => x.key === key);
+    return a ? `${a.emoji ? a.emoji + " " : ""}${a.label}` : key;
+  };
   const keyOptions = (cur: string) =>
     attrKeyOptions.some((o) => o.value === cur)
       ? attrKeyOptions
@@ -967,7 +972,8 @@ export default function ToolsPage() {
               {form.effects.length === 0 && (
                 <p className="text-xs text-muted/70">
                   Необязательно. Пример: инструмент «свидание» добавляет +1 к ключу closeness
-                  получателя.
+                  получателя. Значение может быть отрицательным — так инструмент
+                  уменьшает характеристику (настроение −1, деньги −50).
                 </p>
               )}
               {form.effects.map((e, i) => (
@@ -1014,7 +1020,7 @@ export default function ToolsPage() {
                         const num = Number(v);
                         setEffect(i, { value: v !== "" && !Number.isNaN(num) ? num : v });
                       }}
-                      placeholder="1"
+                      placeholder="±1"
                     />
                   </div>
                   <IconBtn
@@ -1406,7 +1412,7 @@ export default function ToolsPage() {
                             const num = Number(v);
                             setOutcomeEffect(oi, ei, { value: v !== "" && !Number.isNaN(num) ? num : v });
                           }}
-                          placeholder="1"
+                          placeholder="±1"
                         />
                       </div>
                       <IconBtn
@@ -1496,7 +1502,7 @@ export default function ToolsPage() {
                 <div className="mt-3 border-t border-line pt-2 text-xs text-muted">
                   Эффекты:{" "}
                   {t.effects
-                    .map((e) => `${e.target === "self" ? "актёр" : e.target === "relation" ? "отношение получателя" : e.target === "chemistry" ? "химия пары" : "получатель"}.${e.key} ${e.op === "add" ? "+=" : "="} ${JSON.stringify(e.value)}`)
+                    .map((e) => `${e.target === "self" ? "актёр" : e.target === "relation" ? "отношение получателя" : e.target === "chemistry" ? "химия пары" : "получатель"}.${e.target === "relation" || e.target === "chemistry" ? e.key : attrName(e.key)} ${e.op === "add" ? "+=" : "="} ${JSON.stringify(e.value)}`)
                     .join("; ")}
                 </div>
               )}

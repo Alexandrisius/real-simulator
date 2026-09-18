@@ -3,8 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Bot, Loader2, RefreshCw, Send, Sparkles, User } from "lucide-react";
-import { Badge, Btn, Card, ErrorText, Field, Input, PageHeader } from "@/components/ui";
+import { Badge, Btn, Card, ErrorText, Field, IconBtn, Input, PageHeader } from "@/components/ui";
 import { Dropdown } from "@/components/Dropdown";
+import { Combobox } from "@/components/Combobox";
 import { api, apiPost } from "@/components/api";
 
 interface ChatMsg {
@@ -33,6 +34,8 @@ export default function SetupAssistantPage() {
   const [cfg, setCfg] = useState<AssistantConfig | null>(null);
   const [modelDraft, setModelDraft] = useState("");
   const [models, setModels] = useState<string[]>([]);
+  const [modelsError, setModelsError] = useState("");
+  const [loadingModels, setLoadingModels] = useState(false);
   const [cfgError, setCfgError] = useState("");
   const [cfgSaved, setCfgSaved] = useState(false);
   const [messages, setMessages] = useState<ChatMsg[]>([]);
@@ -41,36 +44,43 @@ export default function SetupAssistantPage() {
   const [error, setError] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  /** Список моделей провайдера — как в редакторе персонажа: выбирать, а не вбивать. */
+  const loadModels = useCallback(async (providerId: number) => {
+    if (!providerId) return;
+    setLoadingModels(true);
+    setModelsError("");
+    try {
+      const r = await api<string[]>(`/api/providers/${providerId}/models`);
+      setModels(r);
+      if (r.length === 0) setModelsError("Список пуст — сервер не отдаёт модели, введите имя вручную");
+    } catch (e) {
+      setModels([]);
+      setModelsError(`${e instanceof Error ? e.message : String(e)} — можно ввести имя модели вручную`);
+    } finally {
+      setLoadingModels(false);
+    }
+  }, []);
+
   const loadCfg = useCallback(() => {
     api<AssistantConfig>("/api/assistant")
       .then((c) => {
         setCfg(c);
         setModelDraft(c.model);
+        if (c.providerId) loadModels(c.providerId);
       })
       .catch((e) => setCfgError(e.message));
-  }, []);
+  }, [loadModels]);
   useEffect(loadCfg, [loadCfg]);
 
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
   }, [messages, busy]);
 
-  const fetchModels = async () => {
-    if (!cfg) return;
-    setCfgError("");
-    try {
-      const list = await api<string[]>(`/api/providers/${cfg.providerId}/models`);
-      setModels(list);
-    } catch (e) {
-      setCfgError(e instanceof Error ? e.message : String(e));
-    }
-  };
-
   const saveCfg = async (model?: string) => {
     if (!cfg) return;
     const m = (model ?? modelDraft).trim();
     if (!m) {
-      setCfgError("Выберите модель (кнопка ⟳ подтянет список)");
+      setCfgError("Выберите модель из списка (⟳ — обновить)");
       return;
     }
     setCfgError("");
@@ -136,41 +146,41 @@ export default function SetupAssistantPage() {
                 disabled={!cfg || cfg.providers.length === 0 || busy}
                 onChange={(v) => {
                   setModels([]);
+                  setModelsError("");
                   setCfg((c) => (c ? { ...c, providerId: Number(v) } : c));
+                  loadModels(Number(v));
                 }}
               />
             </Field>
           </div>
           <div className="min-w-64 flex-1">
-            <Field label="Модель" hint="⟳ — подтянуть список моделей провайдера">
+            <Field
+              label="Модель"
+              hint={modelsError || "Выберите из списка провайдера (⟳ — обновить) или введите вручную"}
+            >
               <div className="flex gap-2">
-                {models.length > 0 ? (
-                  <Dropdown
-                    value={modelDraft}
-                    options={models.map((m) => ({ value: m, label: m }))}
-                    disabled={busy}
-                    onChange={(v) => {
-                      setModelDraft(v);
-                      saveCfg(v);
-                    }}
-                  />
-                ) : (
-                  <Input
-                    value={modelDraft}
-                    disabled={busy}
-                    onChange={(e) => setModelDraft(e.target.value)}
-                    placeholder="имя модели, напр. grok-code или qwen/qwen-3-235b-a22b-instruct"
-                    className="font-mono text-xs"
-                  />
-                )}
-                <Btn onClick={fetchModels} loading={false} title="Подтянуть список моделей">
-                  <RefreshCw className="h-4 w-4" />
+                <Combobox
+                  value={modelDraft}
+                  onChange={(v) => {
+                    setModelDraft(v);
+                    // Выбор из списка сохраняет сразу; ручной ввод — кнопкой «Сохранить»
+                    if (models.includes(v)) saveCfg(v);
+                  }}
+                  options={models}
+                  placeholder="имя модели, напр. glm-5.3-flash"
+                  className="min-w-0 flex-1"
+                  inputClassName="font-mono text-xs"
+                />
+                <IconBtn
+                  label="Обновить список моделей"
+                  loading={loadingModels}
+                  onClick={() => cfg?.providerId && loadModels(cfg.providerId)}
+                >
+                  {!loadingModels && <RefreshCw className="h-[18px] w-[18px]" />}
+                </IconBtn>
+                <Btn variant="primary" onClick={() => saveCfg()}>
+                  Сохранить
                 </Btn>
-                {models.length === 0 && (
-                  <Btn variant="primary" onClick={() => saveCfg()}>
-                    Сохранить
-                  </Btn>
-                )}
               </div>
             </Field>
           </div>

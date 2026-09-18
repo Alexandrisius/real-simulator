@@ -1077,6 +1077,11 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
     }
   };
 
+  /** Красивое имя характеристики для заявок: «😊 Настроение», а не «mood». */
+  const attrName = (key: string) => {
+    const a = attrs.find((x) => x.key === key);
+    return a ? `${a.emoji ? a.emoji + " " : ""}${a.label}` : key;
+  };
   const pendingCount = requests?.filter((r) => r.status === "pending").length ?? 0;
 
   const decide = async (reqId: number, action: "approve" | "reject") => {
@@ -2281,7 +2286,7 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                       {r.draft.effects.length > 0 && (
                         <span>
                           <span className="text-fg/70">эффекты:</span>{" "}
-                          {r.draft.effects.map((e) => `${e.target === "self" ? "актёр" : "получатель"}.${e.key} ${e.op === "add" ? "+=" : "="} ${JSON.stringify(e.value)}`).join("; ")}
+                          {r.draft.effects.map((e) => `${e.target === "self" ? "актёр" : "получатель"}.${attrName(e.key)} ${e.op === "add" ? "+=" : "="} ${JSON.stringify(e.value)}`).join("; ")}
                         </span>
                       )}
                     </div>

@@ -833,6 +833,32 @@ async function main() {
   assert(manualBuy.ok, "ручной shop_buy работает");
   assert((getCharacter(yana.id)!.state.money as number) === 35, "ручная покупка списала деньги");
 
+  // Отрицательный эффект: подарок может УМЕНЬШАТЬ характеристику получателя
+  {
+    const { createProduct } = await import("../src/db/queries");
+    createProduct({
+      name: "Кислое яблоко",
+      emoji: "🍏",
+      description: "Портит настроение",
+      category: "еда",
+      price: 1,
+      effects: [{ target: "tool_target", key: "mood", op: "add", value: -2 }],
+    });
+    const yMood = getCharacter(yana.id)!.state.mood as number;
+    const dMood = getCharacter(dima.id)!.state.mood as number;
+    const sour = executeShopBuy({
+      actor: getCharacter(yana.id)!,
+      participants: [getCharacter(yana.id)!, getCharacter(dima.id)!],
+      args: { item: "Кислое яблоко", for: "Дима" },
+    });
+    assert(sour.ok, "покупка с отрицательным эффектом прошла");
+    assert(
+      (getCharacter(dima.id)!.state.mood as number) === dMood - 2,
+      `отрицательный эффект применился: настроение ${dMood} → ${getCharacter(dima.id)!.state.mood}`
+    );
+    assert((getCharacter(yana.id)!.state.mood as number) === yMood, "актёра не задело");
+  }
+
   // Скоринг по покупке: шаг с argContains
   const buySchema = createValidationSchema({
     name: "Подарок сделан",
@@ -3848,7 +3874,7 @@ async function main() {
   // =====================================================================
   {
     const { runAssistantAction } = await import("../src/lib/assistant");
-    const { listFlows, getScene } = await import("../src/db/queries");
+    const { listFlows, getScene, listCombos, listTools } = await import("../src/db/queries");
     const ctx = { providerId: provider.id, model: "mock-actor" };
     const act = (name: string, args: Record<string, unknown>) => {
       try {
@@ -3907,6 +3933,65 @@ async function main() {
       goals: { "Вика Ассист": "Понравиться, но не показывать этого" },
     });
     assert(scene.ok, `ассистент: сцена создана (${scene.summary})`);
+
+    // Комбо, химия и исходы — ассистент умеет ВСЕ сущности приложения
+    const comboToolA = act("create_tool", {
+      name: "combo_step_a",
+      title: "Шаг А",
+      description: "Первый шаг цепочки.",
+      parameters: { type: "object", properties: { to: { type: "string" } }, required: ["to"] },
+      audience: "target",
+      targetParam: "to",
+    });
+    assert(comboToolA.ok, `ассистент: тул для комбо создан (${comboToolA.summary})`);
+    const toolWithOutcome = act("create_tool", {
+      name: "combo_step_b",
+      title: "Шаг Б",
+      description: "Второй шаг с исходом.",
+      parameters: { type: "object", properties: { to: { type: "string" } }, required: ["to"] },
+      audience: "target",
+      targetParam: "to",
+      outcomes: [
+        {
+          title: "Искра",
+          conditions: [{ kind: "relation", op: ">=", value: 3 }],
+          effects: [{ target: "tool_target", key: "mood", op: "add", value: 1 }],
+          noticeTarget: "Всё сложилось.",
+        },
+      ],
+    });
+    assert(toolWithOutcome.ok, `ассистент: тул с исходом создан (${toolWithOutcome.summary})`);
+    const createdOutcomeTool = listTools().find((t) => t.name === "combo_step_b")!;
+    assert(
+      createdOutcomeTool.outcomes.length === 1 && createdOutcomeTool.outcomes[0].conditions[0].kind === "relation",
+      "исход тула записан с условием"
+    );
+
+    const combo = act("create_combo", {
+      name: "test_chain",
+      title: "Тестовая цепочка",
+      description: "А потом Б — и что-то случится.",
+      steps: [{ toolName: "combo_step_a" }, { toolName: "combo_step_b", targetName: "Вика Ассист" }],
+      knowers: ["Игрок Андрей"],
+      announce: true,
+    });
+    assert(combo.ok, `ассистент: комбо создано (${combo.summary})`);
+    assert(listCombos().some((c) => c.name === "test_chain"), "комбо в БД после create_combo");
+
+    const badCombo = act("create_combo", {
+      name: "bad_chain",
+      title: "Плохая цепочка",
+      steps: [{ toolName: "no_such_tool" }, { toolName: "combo_step_a" }],
+    });
+    assert(!badCombo.ok, "ассистент: комбо с несуществующим тулом отклонено");
+
+    const chem = act("set_chemistry", { a: "Игрок Андрей", b: "Вика Ассист", value: 2 });
+    assert(chem.ok, `ассистент: химия задана (${chem.summary})`);
+    const { getChemistry } = await import("../src/db/queries");
+    const allChars = (await import("../src/db/queries")).listCharacters();
+    const chemA = allChars.find((c) => c.name === "Игрок Андрей")!;
+    const chemB = allChars.find((c) => c.name === "Вика Ассист")!;
+    assert(getChemistry(chemA.id, chemB.id) === 2, "химия пары записана в матрицу");
 
     const scenario = act("create_scenario", {
       name: "Вечер с Викой",

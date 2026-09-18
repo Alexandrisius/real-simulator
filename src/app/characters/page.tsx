@@ -5,6 +5,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Plus, Users } from "lucide-react";
 import { Badge, Btn, Card, EmptyState, ErrorText, PageHeader } from "@/components/ui";
 import { api } from "@/components/api";
+import { EmojiPicker } from "@/components/EmojiPicker";
 import type { Character, Provider, Tool } from "@/lib/types";
 
 interface Row extends Character {
