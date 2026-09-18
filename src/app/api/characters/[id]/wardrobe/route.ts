@@ -5,6 +5,7 @@ import {
   getGarmentById,
   listCharacterGarments,
   listClothingSlots,
+  recordWardrobeEdit,
 } from "@/db/queries";
 import { ApiError, jsonError, parseBody, parseId, wardrobeActionSchema } from "@/lib/api";
 import { dressCharacter, undressCharacterSlot, wornName } from "@/lib/wardrobe";
@@ -40,7 +41,8 @@ export async function POST(req: Request, { params }: Ctx) {
   try {
     const { id } = await params;
     const charId = parseId(id);
-    if (!getCharacter(charId)) throw new ApiError(404, "Персонаж не найден");
+    const charBefore = getCharacter(charId);
+    if (!charBefore) throw new ApiError(404, "Персонаж не найден");
     const data = await parseBody(req, wardrobeActionSchema);
     if (data.action === "wear") {
       const r = dressCharacter(charId, data.garmentId);
@@ -53,6 +55,11 @@ export async function POST(req: Request, { params }: Ctx) {
       const r = undressCharacterSlot(charId, slot);
       if (!r.ok) throw new ApiError(400, r.message);
     }
+    // Переодевание в редакторе — правка Архитектора: дельта state (ключи
+    // слотов и эффекты) уходит в зеркало+оверлей, чтобы «Заново» сцены
+    // вернул прогресс, но не конфигурацию одежды из редактора.
+    const charAfter = getCharacter(charId);
+    if (charAfter) recordWardrobeEdit(charId, charBefore.state, charAfter.state);
     return NextResponse.json(wardrobeView(charId));
   } catch (e) {
     return jsonError(e);

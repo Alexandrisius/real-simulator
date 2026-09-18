@@ -8,9 +8,14 @@ JSON. Ошибки: `{"error": "текст"}`, 400 при нарушении zod
 ## Провайдеры
 
 ```bash
-# Создать (kind: lmstudio | openrouter | openai-compatible | mock)
+# Создать (kind: lmstudio | openrouter | opencode | openai-compatible | mock)
 curl -s http://localhost:3999/api/providers -H "Content-Type: application/json" \
   -d '{"name":"LM Studio","kind":"lmstudio","baseUrl":"http://localhost:1234/v1"}'
+
+# OpenCode Go (подписка opencode.ai/auth): шлюз OpenAI-совместимый,
+# заголовок x-opencode-session приложение ставит само
+curl -s http://localhost:3999/api/providers -H "Content-Type: application/json" \
+  -d '{"name":"OpenCode Go","kind":"opencode","baseUrl":"https://opencode.ai/zen/go/v1","apiKey":"..."}'
 
 # Список моделей / проверка соединения
 curl -s "http://localhost:3999/api/providers/1/models?test=1"
@@ -170,7 +175,12 @@ curl -s http://localhost:3999/api/characters -H "Content-Type: application/json"
 переписываются в `conditions`.
 
 `PATCH /api/characters/:id` со `state` **мёржит по ключам** (полная замена
-стерла бы свежие изменения движка); `null` в значении удаляет ключ. `state` —
+стерла бы свежие изменения движка); `null` в значении удаляет ключ. Правки
+запоминаются оверлеем `scene_characters.editor_overlay`: полный сброс сцены
+«Заново» (`POST /api/scenes/:id/reset {"full":true}`) восстанавливает снимок
+state на момент рассадки, а затем накатывает оверлей — явно заданные в
+редакторе значения (деньги, статичные черты) откат «Заново» не сжигает,
+откатывается только прогресс сцены (траты, эффекты). `state` —
 свободный JSON, но ключи атрибутов должны быть в реестре
 (значения клампятся по min/max). `money` — атрибут «Деньги» из дефолтного
 сида (min 0): его списание делает `cost` тулов, начисление — доход во флоу.
@@ -231,6 +241,12 @@ curl -s http://localhost:3999/api/scenes/1/events
 curl -s http://localhost:3999/api/scenes/1/apilogs
 curl -s http://localhost:3999/api/scenes/1/scores
 curl -s -X POST http://localhost:3999/api/scenes/1/reset
+
+# Активные предложения сцены (тулы с requiresConsent, ждущие ответа адресата)
+curl -s http://localhost:3999/api/scenes/1/offers
+# Ответить за адресата можно тем же act: respond_to_offer (offer = id из списка)
+curl -s http://localhost:3999/api/scenes/1/act -H "Content-Type: application/json" \
+  -d '{"characterId":2,"toolName":"respond_to_offer","args":{"offer":"3","decision":"accept"}}'
 ```
 
 `reset` стирает события/курсор/траты, а также предложения, блокировки и

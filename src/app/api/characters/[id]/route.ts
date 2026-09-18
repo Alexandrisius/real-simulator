@@ -5,6 +5,7 @@ import {
   getCharacter,
   getProvider,
   mirrorStateKeysToSceneSnapshots,
+  overlayEditorState,
   updateCharacter,
 } from "@/db/queries";
 import { ApiError, characterSchema, jsonError, parseBody, parseId } from "@/lib/api";
@@ -54,9 +55,12 @@ export async function PATCH(req: Request, { params }: Ctx) {
         }
       }
       data.state = merged;
-      // Правки из редактора переживают «Заново» сцен: новые ключи попадают
-      // и в снимки участий (existing значения не трогаем — это прогресс сцен).
+      // Правки из редактора переживают «Заново» сцены: новые ключи попадают
+      // и в снимки участий, а все правки — в оверлей, который «Заново»
+      // накатывает поверх снимка (существующие значения снимка не трогаем —
+      // это прогресс сцен).
       mirrorStateKeysToSceneSnapshots(cid, edited);
+      overlayEditorState(cid, edited);
     }
     const c = updateCharacter(cid, data);
     if (!c) throw new ApiError(404, "Персонаж не найден");

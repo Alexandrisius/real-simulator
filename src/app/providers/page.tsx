@@ -32,6 +32,12 @@ const KIND_OPTIONS: { value: ProviderKind; label: string; hint: string; defaultU
     defaultUrl: "https://openrouter.ai/api/v1",
   },
   {
+    value: "opencode",
+    label: "OpenCode Go / Zen (облако)",
+    hint: "Подписка OpenCode Go: дешёвые открытые модели (GLM, Kimi, DeepSeek…). Ключ — в консоли opencode.ai/auth (подпишитесь на Go и скопируйте API-ключ). Список моделей — кнопкой «Проверить».",
+    defaultUrl: "https://opencode.ai/zen/go/v1",
+  },
+  {
     value: "openai-compatible",
     label: "Другой OpenAI-совместимый",
     hint: "llama.cpp, vLLM, Ollama (+openai), TabbyAPI и т.п.",

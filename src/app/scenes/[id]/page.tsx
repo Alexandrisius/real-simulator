@@ -1,6 +1,6 @@
 "use client";
 
-import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import {
   ArrowDown,
@@ -26,12 +26,26 @@ import {
 import { Badge, Btn, Card, ErrorText, Field, IconBtn, Input, StatusBadge, Textarea } from "@/components/ui";
 import { Dropdown } from "@/components/Dropdown";
 import { api, apiPatch, apiPost } from "@/components/api";
-import type { Audience, AttributeDef, Character, ClothingSlot, FinishCondition, Place, Scene, SimEvent, SceneStatus, StreamMessage, ApiLog, Tool, CharacterScore, ToolRequest, ShopProduct } from "@/lib/types";
+import type { Audience, AttributeDef, Character, ClothingSlot, FinishCondition, Garment, Place, Scene, SimEvent, SceneStatus, StreamMessage, ApiLog, Tool, CharacterScore, ToolRequest, ShopProduct } from "@/lib/types";
 
 interface RequestRow extends ToolRequest {
   characterName: string;
   characterEmoji: string;
   sceneName: string;
+}
+
+/** Активное предложение сцены (GET /api/scenes/:id/offers) — для выбора в ручном ответе. */
+interface SceneOffer {
+  id: number;
+  toolName: string;
+  toolTitle: string;
+  fromId: number;
+  fromName: string;
+  fromEmoji: string;
+  toId: number;
+  toName: string;
+  toEmoji: string;
+  args: Record<string, unknown>;
 }
 
 /** Пресеты паузы между ходами агентов (мс) — регулятор «вайба» в шапке. */
@@ -162,13 +176,18 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
   const [finishDelay, setFinishDelay] = useState(2);
   const [showRequests, setShowRequests] = useState(false);
   const [requests, setRequests] = useState<RequestRow[] | null>(null);
-  const [requestReason, setRequestReason] = useState("");
+  /** Комментарий Архитектора к решению по заявке — свой на каждую заявку. */
+  const [requestReasons, setRequestReasons] = useState<Record<number, string>>({});
   const [requestBusy, setRequestBusy] = useState(0);
+  /** Идёт ли ответ на предложение (id предложения) — для карточек в ленте. */
+  const [offerBusy, setOfferBusy] = useState<number | null>(null);
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickRef = useRef(true);
   const lastIdRef = useRef(0);
   const [newCount, setNewCount] = useState(0);
+  /** Режим ввода выставлен вручную (тогглом) — дефолт больше не навязываем. */
+  const modeTouchedRef = useRef(false);
 
   /** Слияние событий по id — устойчиво к гонкам REST-снимка и SSE. */
   const mergeEvents = useCallback((incoming: SimEvent[]) => {
@@ -218,6 +237,12 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
       setGoalDrafts(
         Object.fromEntries(d.participants.map((p) => [String(p.id), p.goal ?? ""]))
       );
+      // Дефолт режима ввода: если в сцене есть человек — говорим от его лица.
+      // Архитектора всегда можно вернуть тогглом (modeTouchedRef фиксирует выбор).
+      if (!modeTouchedRef.current && mode === "director") {
+        const human = d.participants.find((p) => p.isHuman);
+        if (human) setMode(String(human.id));
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
@@ -262,6 +287,15 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
     }
   }, [sid]);
 
+  /** Живые предложения сцены: карточки в ленте и выбор в respond_to_offer. */
+  const loadOffers = useCallback(async () => {
+    try {
+      setOffers(await api<SceneOffer[]>(`/api/scenes/${sid}/offers`));
+    } catch {
+      /* не критично для комнаты */
+    }
+  }, [sid]);
+
   useEffect(() => {
     loadRequests();
   }, [loadRequests]);
@@ -289,6 +323,8 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
       if (msg.type === "event") {
         mergeEvents([msg.event]);
         if (!stickRef.current) setNewCount((n) => n + 1);
+        // Предложения живут своей жизнью (созданы/приняты агентами) — освежим.
+        loadOffers();
       } else if (msg.type === "status") {
         setData((d) =>
           d
@@ -311,7 +347,7 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
       }
     };
     return () => es.close();
-  }, [sid, loadScene, mergeEvents, loadRequests]);
+  }, [sid, loadScene, mergeEvents, loadRequests, loadOffers]);
 
   // автоскролл
   useEffect(() => {
@@ -388,24 +424,42 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
 
   const modeChar = mode !== "director" ? charById.get(Number(mode)) ?? null : null;
   const [products, setProducts] = useState<ShopProduct[]>([]);
+  const [garments, setGarments] = useState<Garment[]>([]);
+  /** Предметы, которыми владеет текущий персонаж (для wear_garment). */
+  const [ownedGarments, setOwnedGarments] = useState<Garment[]>([]);
   const [hasHiddenAttrs, setHasHiddenAttrs] = useState(false);
-  const [hasClothing, setHasClothing] = useState(false);
+  const [clothingSlots, setClothingSlots] = useState<ClothingSlot[]>([]);
+  const hasClothing = clothingSlots.length > 0;
   const [places, setPlaces] = useState<Place[]>([]);
   /** Реестр характеристик — для выбора ключа в условиях авто-финиша. */
   const [attrs, setAttrs] = useState<AttributeDef[]>([]);
+  /** Активные предложения сцены: выбор в respond_to_offer вместо ручного id. */
+  const [offers, setOffers] = useState<SceneOffer[]>([]);
+
   useEffect(() => {
     api<ShopProduct[]>("/api/products").then(setProducts).catch(() => {});
+    api<Garment[]>("/api/garments").then(setGarments).catch(() => {});
     api<AttributeDef[]>("/api/attributes")
       .then((list) => {
         setAttrs(list);
         setHasHiddenAttrs(list.some((a) => a.visibility === "hidden"));
       })
       .catch(() => {});
-    api<ClothingSlot[]>("/api/clothing-slots")
-      .then((slots) => setHasClothing(slots.length > 0))
-      .catch(() => {});
+    api<ClothingSlot[]>("/api/clothing-slots").then(setClothingSlots).catch(() => {});
     api<Place[]>("/api/places").then(setPlaces).catch(() => {});
-  }, []);
+    loadOffers();
+  }, [loadOffers]);
+
+  // Личный гардероб текущего персонажа: варианты для wear_garment.
+  useEffect(() => {
+    if (mode === "director") {
+      setOwnedGarments([]);
+      return;
+    }
+    api<{ owned: Garment[] }>(`/api/characters/${mode}/wardrobe`)
+      .then((w) => setOwnedGarments(w.owned ?? []))
+      .catch(() => setOwnedGarments([]));
+  }, [mode]);
   const placeOptions = placeOptionsOf(places);
   // Сохранённое место вне реестра показываем отдельным вариантом, чтобы не терять значение.
   const settingsPlaceOptions =
@@ -421,9 +475,15 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
     label: t.title ? `${t.title} · ${t.name}` : t.name,
   }));
 
+  // Ассортимент магазина: товары + продаваемая одежда (зеркалит движок).
+  const shopItems = [
+    ...products.map((p) => ({ name: p.name, emoji: p.emoji, price: p.price })),
+    ...garments.filter((g) => g.price > 0).map((g) => ({ name: g.name, emoji: g.emoji, price: g.price })),
+  ];
+
   // Псевдотулы магазина: доступны всем, в БД не хранятся (исполняет движок).
   const shopPseudoTools: Tool[] =
-    products.length > 0
+    shopItems.length > 0
       ? [
           {
             id: -1,
@@ -446,7 +506,7 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
             id: -2,
             name: "shop_buy",
             title: "Купить в магазине",
-            description: `Купить товар по названию (деньги спишутся). Подарок — укажи получателя. В наличии: ${products
+            description: `Купить товар по названию (деньги спишутся). Подарок — укажи получателя. В наличии: ${shopItems
               .slice(0, 12)
               .map((p) => `${p.name} ($${p.price})`)
               .join(", ")}`,
@@ -602,35 +662,41 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
     );
   }
 
+  // Ответ на предложение: виден только тому, кому действительно предложили
+  // (как у агентов в движке) — и предлагает выбор из живых предложений.
+  const myPendingOffers = offers.filter((o) => o.toId === modeChar?.id);
+  if (myPendingOffers.length > 0) {
+    virtualPseudoTools.push({
+      id: -8,
+      name: "respond_to_offer",
+      title: "Ответить на предложение",
+      description:
+        "Принять (accept) или отклонить (decline) адресованное вам предложение — с ответными словами или без.",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          offer: { type: "string", description: "id предложения, напр. 3" },
+          decision: { type: "string", description: "accept или decline" },
+          words: { type: "string", description: "Что сказать при ответе (необязательно)" },
+        },
+        required: ["offer", "decision"],
+      },
+      audience: "all",
+      targetParam: null,
+      observationTemplate: "{name} отвечает на предложение",
+      effects: [],
+      cost: 0,
+      origin: "manual",
+      createdBy: null,
+      trainsSkill: "",
+      outcomes: [],
+      createdAt: "",
+    });
+  }
+
   // Стоп-инструменты агентов: выдаются, когда в сцене включены allowAgentStops.
   if (data?.scene.config.allowAgentStops ?? true) {
     virtualPseudoTools.push(
-      {
-        id: -8,
-        name: "respond_to_offer",
-        title: "Ответить на предложение",
-        description:
-          "Принять (accept) или отклонить (decline) адресованное вам предложение — с ответными словами или без.",
-        parametersSchema: {
-          type: "object",
-          properties: {
-            offer: { type: "string", description: "id предложения, напр. 3" },
-            decision: { type: "string", description: "accept или decline" },
-            words: { type: "string", description: "Что сказать при ответе (необязательно)" },
-          },
-          required: ["offer", "decision"],
-        },
-        audience: "all",
-        targetParam: null,
-        observationTemplate: "{name} отвечает на предложение",
-        effects: [],
-        cost: 0,
-        origin: "manual",
-        createdBy: null,
-        trainsSkill: "",
-        outcomes: [],
-        createdAt: "",
-      },
       {
         id: -9,
         name: "leave_scene",
@@ -818,6 +884,66 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
     return () => window.removeEventListener("keydown", h);
   }, [showActions, actionToolId]);
 
+  /** Варианты выбора для параметра вместо ручного ввода: enum схемы,
+   *  x-entity-связи с реестрами и спецслучаи виртуальных тулов — зеркалит
+   *  enum-инъекцию движка, чтобы выбор у кукловода совпадал с агентским. */
+  const paramPickOptions = (
+    tool: Tool,
+    key: string,
+    prop: { type?: string; description?: string; enum?: unknown[]; "x-entity"?: string }
+  ): { value: string; label: string; title?: string }[] | null => {
+    const others = (data?.participants ?? []).filter((p) => p.id !== modeChar?.id);
+    const charOpts = others.map((p) => ({ value: p.name, label: `${p.emoji} ${p.name}` }));
+    const shopOpts = shopItems.map((i) => ({
+      value: i.name,
+      label: `${i.emoji} ${i.name} — $${i.price}`,
+    }));
+    // 1. Явный enum в схеме — фиксированный список значений от автора тула
+    if (
+      Array.isArray(prop.enum) &&
+      prop.enum.length > 0 &&
+      prop.enum.every((v) => typeof v === "string")
+    )
+      return (prop.enum as string[]).map((v) => ({ value: v, label: v }));
+    // 2. targetParam и x-entity: те же списки живых сущностей, что движок даёт агенту
+    const ent = prop["x-entity"];
+    if (ent === "character" || (ent == null && tool.targetParam === key))
+      return charOpts.length > 0 ? charOpts : null;
+    if (ent === "place")
+      return places.map((p) => ({ value: p.name, label: p.name, title: p.description }));
+    if (ent === "product" || ent === "garment") return shopOpts;
+    if (ent === "slot") return clothingSlots.map((s) => ({ value: s.slot, label: s.slot }));
+    if (ent === "attribute")
+      return attrs.map((a) => ({ value: a.key, label: `${a.emoji} ${a.label}`, title: a.key }));
+    // 3. Виртуальные тулы движка: enum подставляется по имени тула и параметру
+    if (tool.name === "respond_to_offer" && key === "offer")
+      return myPendingOffers.map((o) => ({
+        value: String(o.id),
+        label: `#${o.id} «${o.toolTitle}» — от ${o.fromName}`,
+        title: `аргументы: ${JSON.stringify(o.args)}`,
+      }));
+    if (tool.name === "shop_buy" && key === "item") return shopOpts;
+    if (tool.name === "reveal_attribute" && key === "attribute")
+      return attrs
+        .filter((a) => a.visibility === "hidden")
+        .map((a) => ({ value: a.key, label: `${a.emoji} ${a.label}`, title: a.key }));
+    if ((tool.name === "undress" || tool.name === "wear") && key === "slot") {
+      const wornOf = (slot: string) => String(modeChar?.state[`worn_${slot}`] ?? "");
+      const carriedOf = (slot: string) => String(modeChar?.state[`carried_${slot}`] ?? "");
+      return clothingSlots.map((s) => {
+        if (tool.name === "undress") {
+          const w = wornOf(s.slot);
+          return { value: s.slot, label: w ? `${s.slot} — надето: ${w}` : `${s.slot} — пусто` };
+        }
+        const c = carriedOf(s.slot);
+        return { value: s.slot, label: c ? `${s.slot} — при тебе: ${c}` : `${s.slot} — ничего` };
+      });
+    }
+    if (tool.name === "wear_garment" && key === "garment")
+      return ownedGarments.map((g) => ({ value: g.name, label: `${g.emoji || "👕"} ${g.name}` }));
+    return null;
+  };
+
   const openAction = (toolId: number) => {
     setActionToolId(toolId);
     // Адресные параметры предзаполняем: если собеседник в сцене один — это он
@@ -840,8 +966,13 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
         }
       }
     }
-    // respond_to_offer: решение по умолчанию — принять (легко переключить на отказ)
-    if (tool?.name === "respond_to_offer" && !preset.decision) preset.decision = "accept";
+    // respond_to_offer: решение по умолчанию — принять, единственное
+    // входящее предложение выбираем сразу (никаких id руками).
+    if (tool?.name === "respond_to_offer" && modeChar) {
+      const mine = offers.filter((o) => o.toId === modeChar.id);
+      if (mine.length === 1 && !preset.offer) preset.offer = String(mine[0].id);
+      if (!preset.decision) preset.decision = "accept";
+    }
     setActionValues(preset);
     setActionError("");
   };  const runAction = async () => {
@@ -890,6 +1021,8 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
       });
       setShowActions(false);
       setActionToolId(null);
+      // Предложения могли создаться/закрыться — освежим (SSE тоже подтянет).
+      loadOffers();
     } catch (e) {
       setActionError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -950,13 +1083,38 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
     setRequestBusy(reqId);
     setError("");
     try {
-      await apiPost(`/api/tool-requests/${reqId}/decision`, { action, reason: requestReason });
-      setRequestReason("");
+      await apiPost(`/api/tool-requests/${reqId}/decision`, {
+        action,
+        reason: requestReasons[reqId] ?? "",
+      });
+      setRequestReasons((s) => {
+        const next = { ...s };
+        delete next[reqId];
+        return next;
+      });
       await loadRequests();
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
       setRequestBusy(0);
+    }
+  };
+
+  /** Ответ на предложение прямо из карточки в ленте: действуем от лица адресата. */
+  const respondOffer = async (offerId: number, toId: number, decision: "accept" | "decline") => {
+    setOfferBusy(offerId);
+    setError("");
+    try {
+      await apiPost(`/api/scenes/${sid}/act`, {
+        characterId: toId,
+        toolName: "respond_to_offer",
+        args: { offer: String(offerId), decision },
+      });
+      await loadOffers();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setOfferBusy(null);
     }
   };
 
@@ -1497,15 +1655,75 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                   Событий ещё нет. Нажмите «Старт» — персонажи начнут действовать по очереди.
                 </p>
               )}
-              {shownEvents.map((ev) => (
-                <EventRow
-                  key={ev.id}
-                  ev={ev}
-                  charById={charById}
-                  colorOf={colorOf}
-                  onOpenApi={openApi}
-                />
-              ))}
+              {shownEvents.map((ev) => {
+                // Предложения и заявки — интерактивные карточки прямо в ленте:
+                // отдельное окно легко пропустить, а решение нужно здесь и сейчас.
+                const calls = ev.type === "action" ? ev.payload.calls ?? [] : [];
+                const offerCalls = calls.filter((c) => c.offered && c.offerId != null);
+                const reqCall = calls.find((c) => c.toolName === "request_tool" && c.ok);
+                const hasPlainCalls =
+                  calls.length === 0 ||
+                  calls.some((c) => !c.offered && c.toolName !== "request_tool");
+                return (
+                  <Fragment key={ev.id}>
+                    {hasPlainCalls && (
+                      <EventRow ev={ev} charById={charById} colorOf={colorOf} onOpenApi={openApi} />
+                    )}
+                    {offerCalls.map((c, i) => {
+                      const live = offers.find((o) => o.id === c.offerId) ?? null;
+                      const from = charById.get(ev.actorId ?? -1) ?? null;
+                      const to = live
+                        ? charById.get(live.toId) ?? null
+                        : charById.get(c.targetId ?? -1) ?? null;
+                      return (
+                        <OfferCard
+                          key={`offer-${ev.id}-${i}`}
+                          live={live}
+                          title={live?.toolTitle ?? c.toolName}
+                          fromName={live?.fromName ?? from?.name ?? "?"}
+                          fromEmoji={live?.fromEmoji ?? from?.emoji ?? "❓"}
+                          toName={live?.toName ?? to?.name ?? "?"}
+                          toId={live?.toId ?? to?.id ?? -1}
+                          offerId={c.offerId!}
+                          args={c.args}
+                          busy={offerBusy === c.offerId}
+                          onRespond={respondOffer}
+                        />
+                      );
+                    })}
+                    {reqCall &&
+                      (() => {
+                        const draftName =
+                          typeof reqCall.args?.name === "string" ? reqCall.args.name : "";
+                        const actor = charById.get(ev.actorId ?? -1) ?? null;
+                        // Заявка могла быть решена в панели или уже закрыта — ищем живую.
+                        const req =
+                          requests?.find(
+                            (r) =>
+                              r.status === "pending" &&
+                              r.characterId === ev.actorId &&
+                              r.toolName === draftName
+                          ) ?? null;
+                        return (
+                          <RequestCard
+                            key={`req-${ev.id}`}
+                            req={req}
+                            draftName={draftName}
+                            actorName={actor?.name ?? "?"}
+                            actorEmoji={actor?.emoji ?? "❓"}
+                            reason={req?.reason ?? String(reqCall.args?.reason ?? "")}
+                            busy={requestBusy}
+                            reasons={requestReasons}
+                            onReason={(id, v) =>
+                              setRequestReasons((s) => ({ ...s, [id]: v }))
+                            }
+                            onDecide={decide}
+                          />
+                        );
+                      })()}
+                  </Fragment>
+                );
+              })}
             </div>
           </div>
 
@@ -1578,6 +1796,7 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
             <button
               type="button"
               onClick={() => {
+                modeTouchedRef.current = true;
                 setMode("director");
                 setShowActions(false);
               }}
@@ -1594,6 +1813,7 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                 key={p.id}
                 type="button"
                 onClick={() => {
+                  modeTouchedRef.current = true;
                   setMode(String(p.id));
                   setShowActions(false);
                 }}
@@ -1789,7 +2009,7 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                         const isNum = p.type === "number";
                         const isStr = p.type === "string" || !p.type;
                         const isComplex = !isBool && !isNum && !isStr;
-                        // Параметр-«получатель»: имя персонажа — выбираем чипом, не печатаем
+                        // Эвристики-фолбэки: «получатель» и «место» по имени ключа/описанию
                         const isPlaceParam =
                           isStr && (key === "place" || /место/i.test(p.description ?? ""));
                         const isCharParam =
@@ -1797,6 +2017,18 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                           !isPlaceParam &&
                           (/^(to|who|for|target|recipient)$/i.test(key) ||
                             /персонаж|получател|кому/i.test(p.description ?? ""));
+                        // Выбор из существующих значений вместо ручного ввода:
+                        // сначала точные списки (enum/x-entity/виртуальные тулы), потом эвристики.
+                        const isDecision = selectedTool.name === "respond_to_offer" && key === "decision";
+                        const pickOptions =
+                          (isDecision
+                            ? null
+                            : paramPickOptions(selectedTool, key, p)) ??
+                          (isCharParam
+                            ? participants.map((pt) => ({ value: pt.name, label: `${pt.emoji} ${pt.name}` }))
+                            : isPlaceParam
+                              ? places.map((pl) => ({ value: pl.name, label: pl.name, title: pl.description }))
+                              : null);
                         const curVal = actionValues[key] ?? "";
                         return (
                           <Field
@@ -1815,15 +2047,7 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                                   { value: "false", label: "нет" },
                                 ]}
                               />
-                            ) : selectedTool.name === "respond_to_offer" && key === "offer" ? (
-                              <Input
-                                value={curVal}
-                                onChange={(e) =>
-                                  setActionValues((v) => ({ ...v, [key]: e.target.value }))
-                                }
-                                placeholder="id предложения, напр. 3"
-                              />
-                            ) : selectedTool.name === "respond_to_offer" && key === "decision" ? (
+                            ) : isDecision ? (
                               <Dropdown
                                 direction="down"
                                 value={actionValues[key] ?? "accept"}
@@ -1833,66 +2057,20 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                                   { value: "decline", label: "отклонить (decline)" },
                                 ]}
                               />
-                            ) : selectedTool.name === "respond_to_offer" && key === "words" ? (
-                              <Input
-                                value={curVal}
-                                onChange={(e) =>
-                                  setActionValues((v) => ({ ...v, [key]: e.target.value }))
-                                }
-                                placeholder="необязательно"
-                              />
-                            ) : isPlaceParam ? (
-                              <div className="flex flex-wrap gap-1.5">
-                                {places.map((pl) => (
-                                  <button
-                                    type="button"
-                                    key={pl.name}
-                                    title={pl.description}
-                                    onClick={() =>
-                                      setActionValues((v) => ({ ...v, [key]: pl.name }))
-                                    }
-                                    className={`rounded-full border px-3 py-1 text-xs transition-colors ${
-                                      curVal === pl.name
-                                        ? "border-accent/60 bg-accent/20 text-fg"
-                                        : "border-line bg-panel-2/50 text-muted hover:text-fg"
-                                    }`}
-                                  >
-                                    {pl.name}
-                                  </button>
-                                ))}
-                              </div>
-                            ) : isCharParam ? (
-                              <div className="flex flex-wrap gap-1.5">
-                                {!required && (
-                                  <button
-                                    type="button"
-                                    onClick={() => setActionValues((v) => ({ ...v, [key]: "" }))}
-                                    className={`rounded-full border px-3 py-1 text-xs transition-colors ${
-                                      curVal === ""
-                                        ? "border-accent/60 bg-accent/20 text-fg"
-                                        : "border-line bg-panel-2/50 text-muted hover:text-fg"
-                                    }`}
-                                  >
-                                    всем / не указывать
-                                  </button>
-                                )}
-                                {participants.map((pt) => (
-                                  <button
-                                    type="button"
-                                    key={pt.id}
-                                    onClick={() =>
-                                      setActionValues((v) => ({ ...v, [key]: pt.name }))
-                                    }
-                                    className={`rounded-full border px-3 py-1 text-xs transition-colors ${
-                                      curVal === pt.name
-                                        ? "border-accent/60 bg-accent/20 text-fg"
-                                        : "border-line bg-panel-2/50 text-muted hover:text-fg"
-                                    }`}
-                                  >
-                                    {pt.emoji} {pt.name}
-                                  </button>
-                                ))}
-                              </div>
+                            ) : pickOptions ? (
+                              pickOptions.length === 0 ? (
+                                <p className="text-xs leading-relaxed text-muted">
+                                  Нет доступных значений — выберите нечего.
+                                </p>
+                              ) : (
+                                <ChipChoices
+                                  options={pickOptions}
+                                  value={curVal}
+                                  allowEmpty={!required}
+                                  emptyLabel={isCharParam ? "всем / не указывать" : "не указывать"}
+                                  onPick={(v) => setActionValues((s) => ({ ...s, [key]: v }))}
+                                />
+                              )
                             ) : isStr ? (
                               <Textarea
                                 rows={2}
@@ -2119,8 +2297,10 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                     {r.status === "pending" && (
                       <div className="mt-3 flex flex-col gap-2">
                         <Input
-                          value={requestReason}
-                          onChange={(e) => setRequestReason(e.target.value)}
+                          value={requestReasons[r.id] ?? ""}
+                          onChange={(e) =>
+                            setRequestReasons((s) => ({ ...s, [r.id]: e.target.value }))
+                          }
                           placeholder="Комментарий (необязательно): почему да / почему нет"
                           className="text-xs"
                         />
@@ -2217,6 +2397,240 @@ export default function SceneRoomPage({ params }: { params: Promise<{ id: string
                 </div>
               ))}
             </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ---------- Карточки решений прямо в ленте ----------
+
+/** Класс чипа выбора (единый стиль с прежними чипами персонажей/мест). */
+const chipCls = (active: boolean) =>
+  `rounded-full border px-3 py-1 text-xs transition-colors ${
+    active
+      ? "border-accent/60 bg-accent/20 text-fg"
+      : "border-line bg-panel-2/50 text-muted hover:text-fg"
+  }`;
+
+/** Чипы выбора значения параметра: существующие сущности вместо ручного ввода. */
+function ChipChoices({
+  options,
+  value,
+  allowEmpty,
+  emptyLabel = "не указывать",
+  onPick,
+}: {
+  options: { value: string; label: string; title?: string }[];
+  value: string;
+  allowEmpty: boolean;
+  emptyLabel?: string;
+  onPick: (v: string) => void;
+}) {
+  return (
+    <div className="flex flex-wrap gap-1.5">
+      {allowEmpty && (
+        <button type="button" onClick={() => onPick("")} className={chipCls(value === "")}>
+          {emptyLabel}
+        </button>
+      )}
+      {options.map((o) => (
+        <button
+          key={o.value}
+          type="button"
+          title={o.title}
+          onClick={() => onPick(o.value)}
+          className={chipCls(value === o.value)}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * Предложение действия (requiresConsent) в ленте: пока живо — оранжевая
+ * карточка с кнопками принять/отклонить от лица адресата; решённое — приглушено.
+ */
+function OfferCard({
+  live,
+  title,
+  fromName,
+  fromEmoji,
+  toName,
+  toId,
+  offerId,
+  args,
+  busy,
+  onRespond,
+}: {
+  live: SceneOffer | null;
+  title: string;
+  fromName: string;
+  fromEmoji: string;
+  toName: string;
+  toId: number;
+  offerId: number;
+  args: Record<string, unknown>;
+  busy: boolean;
+  onRespond: (offerId: number, toId: number, decision: "accept" | "decline") => void;
+}) {
+  return (
+    <div
+      className={`anim-in rounded-xl border px-4 py-3 text-sm ${
+        live ? "border-warn/40 bg-warn/5" : "border-line bg-panel/40 opacity-70"
+      }`}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span title="Предложение действия — ждёт согласия адресата">💍</span>
+        <span className="font-medium">
+          {fromEmoji} {fromName}
+        </span>
+        <span className="text-muted">предлагает {toName}:</span>
+        <span className="font-medium">«{title}»</span>
+        {live ? (
+          <>
+            <Btn
+              className="ml-2 h-8"
+              onClick={() => onRespond(offerId, toId, "accept")}
+              loading={busy}
+              title={`Согласиться за ${toName}: действие произойдёт сразу`}
+            >
+              <Check className="h-4 w-4" /> Принять
+            </Btn>
+            <Btn
+              variant="danger"
+              className="h-8"
+              onClick={() => onRespond(offerId, toId, "decline")}
+              loading={busy}
+              title={`Отказаться за ${toName}`}
+            >
+              <X className="h-4 w-4" /> Отклонить
+            </Btn>
+            <span className="text-[11px] text-muted">ждёт ответа: {toName}</span>
+          </>
+        ) : (
+          <span className="text-[11px] text-muted">
+            — предложение закрыто (получен ответ или оно сгорело)
+          </span>
+        )}
+      </div>
+      {Object.keys(args).length > 0 && (
+        <details className="mt-1.5">
+          <summary className="cursor-pointer text-[11px] text-muted/70 hover:text-muted">
+            с какими параметрами
+          </summary>
+          <pre className="mt-1 overflow-auto rounded-lg bg-black/30 p-2 font-mono text-[10px] leading-relaxed text-muted">
+            {JSON.stringify(args, null, 2)}
+          </pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Заявка агента на новый инструмент в ленте: пока на рассмотрении —
+ * оранжевая карточка с решением Архитектора; решённая — приглушена.
+ */
+function RequestCard({
+  req,
+  draftName,
+  actorName,
+  actorEmoji,
+  reason,
+  busy,
+  reasons,
+  onReason,
+  onDecide,
+}: {
+  req: RequestRow | null;
+  draftName: string;
+  actorName: string;
+  actorEmoji: string;
+  reason: string;
+  busy: number;
+  reasons: Record<number, string>;
+  onReason: (id: number, v: string) => void;
+  onDecide: (id: number, action: "approve" | "reject") => void;
+}) {
+  const draft = req?.draft ?? null;
+  return (
+    <div
+      className={`anim-in rounded-xl border px-4 py-3 text-sm ${
+        req ? "border-warn/40 bg-warn/5" : "border-line bg-panel/40 opacity-70"
+      }`}
+    >
+      <div className="flex flex-wrap items-center gap-2">
+        <span title="Заявка агента на новый инструмент">🛠</span>
+        <span className="font-medium">
+          {actorEmoji} {actorName}
+        </span>
+        <span className="text-muted">просит инструмент:</span>
+        <span className="font-medium">
+          «{draft?.title || draftName || "?"}»
+        </span>
+        <span className="font-mono text-[11px] text-accent/80">{draftName}</span>
+        {req ? (
+          <Badge color="warn">на рассмотрении</Badge>
+        ) : (
+          <span className="text-[11px] text-muted">— заявка решена</span>
+        )}
+      </div>
+      {reason && (
+        <p className="mt-1.5 rounded-lg border border-accent/20 bg-accent/5 px-2.5 py-1.5 text-xs leading-relaxed text-muted">
+          «{reason}»
+        </p>
+      )}
+      {draft && draft.description && (
+        <p className="mt-1.5 text-xs leading-relaxed text-muted/80">{draft.description}</p>
+      )}
+      {draft && (
+        <details className="mt-1.5">
+          <summary className="cursor-pointer text-[11px] text-muted/70 hover:text-muted">
+            черновик: параметры, видимость, эффекты
+            {draft.cost > 0 ? ` · цена $${draft.cost}` : ""}
+          </summary>
+          <pre className="mt-1 max-h-40 overflow-auto rounded-lg bg-black/30 p-2 font-mono text-[10px] leading-relaxed text-muted">
+            {JSON.stringify(
+              {
+                параметры: draft.parametersSchema,
+                видимость: draft.audience,
+                наблюдение: draft.observationTemplate,
+                эффекты: draft.effects,
+              },
+              null,
+              2
+            )}
+          </pre>
+        </details>
+      )}
+      {req && (
+        <div className="mt-2.5 flex flex-col gap-2">
+          <Input
+            value={reasons[req.id] ?? ""}
+            onChange={(e) => onReason(req.id, e.target.value)}
+            placeholder="Комментарий (необязательно): почему да / почему нет"
+            className="text-xs"
+          />
+          <div className="flex gap-2">
+            <Btn
+              className="h-8 flex-1"
+              onClick={() => onDecide(req.id, "approve")}
+              loading={busy === req.id}
+            >
+              <Check className="h-4 w-4" /> Одобрить и создать
+            </Btn>
+            <Btn
+              variant="danger"
+              className="h-8 flex-1"
+              onClick={() => onDecide(req.id, "reject")}
+              loading={busy === req.id}
+            >
+              <X className="h-4 w-4" /> Отклонить
+            </Btn>
           </div>
         </div>
       )}

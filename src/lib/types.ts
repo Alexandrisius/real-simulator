@@ -4,6 +4,7 @@
 export type ProviderKind =
   | "lmstudio"
   | "openrouter"
+  | "opencode"
   | "openai-compatible"
   | "mock";
 
@@ -654,6 +655,8 @@ export interface ActionCall {
    * только исполненные вызовы (offered не считаются).
    */
   offered?: boolean;
+  /** id созданного предложения (для offered-вызовов) — карточка в ленте комнаты */
+  offerId?: number;
 }
 
 export interface EventPayload {

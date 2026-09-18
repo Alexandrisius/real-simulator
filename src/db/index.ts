@@ -456,6 +456,11 @@ function migrateSceneCharacters(db: DB): void {
     // Ушёл из сцены (leave_scene): из ротации исчезает навсегда, до пересбора состава
     db.exec("ALTER TABLE scene_characters ADD COLUMN left_scene INTEGER NOT NULL DEFAULT 0");
   }
+  if (!cols.some((c) => c.name === "editor_overlay")) {
+    // Оверлей правок редактора поверх снимка: «Заново» = снимок на момент
+    // рассадки + то, что Архитектор явно правил у персонажа после неё.
+    db.exec("ALTER TABLE scene_characters ADD COLUMN editor_overlay TEXT");
+  }
 }
 
 /** Миграция старых баз: счётчики расходов сцены (вызовы API и токены). */

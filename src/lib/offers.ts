@@ -98,10 +98,11 @@ export function createOfferProposal(input: {
     };
   }
 
-  createOffer(sceneId, actor.id, target.id, tool.name, args, turn, turn + OFFER_TTL_TURNS);
+  const created = createOffer(sceneId, actor.id, target.id, tool.name, args, turn, turn + OFFER_TTL_TURNS);
   return {
     ok: true,
     offered: true,
+    offerId: created.id,
     result:
       `Предложение отправлено: «${title}» → ${target.name}. Действие произойдёт, только если ` +
       `${target.name} согласится в свой ход. Продолжай общение, не повторяй предложение.`,

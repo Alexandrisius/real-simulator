@@ -72,6 +72,11 @@ export interface ChatOptions {
   signal?: AbortSignal;
   /** Контекст для mock-провайдера */
   mockContext?: MockContext;
+  /**
+   * Стабильный идентификатор «беседы» (у нас — персонаж). OpenCode Go/Zen
+   * требуют заголовок x-opencode-session для маршрутизации и кэша промптов.
+   */
+  sessionId?: string;
 }
 
 function normalizeBase(baseUrl: string): string {
@@ -79,23 +84,31 @@ function normalizeBase(baseUrl: string): string {
 }
 
 /**
- * Базовый endpoint провайдера. Для LM Studio и OpenRouter автоматически
- * дописываем /v1, если пользователь забыл (частая опечатка).
+ * Базовый endpoint провайдера. Для LM Studio, OpenRouter и OpenCode
+ * автоматически дописываем /v1, если пользователь забыл (частая опечатка).
  */
 function endpointUrl(p: Provider): string {
   let base = normalizeBase(p.baseUrl);
-  if ((p.kind === "lmstudio" || p.kind === "openrouter") && !/\/v\d+$/.test(base)) {
+  if (
+    (p.kind === "lmstudio" || p.kind === "openrouter" || p.kind === "opencode") &&
+    !/\/v\d+$/.test(base)
+  ) {
     base += "/v1";
   }
   return base;
 }
 
-function authHeaders(p: Provider): Record<string, string> {
+function authHeaders(p: Provider, sessionId?: string): Record<string, string> {
   const h: Record<string, string> = { "Content-Type": "application/json" };
   if (p.apiKey) h["Authorization"] = `Bearer ${p.apiKey}`;
   if (p.kind === "openrouter") {
     h["X-Title"] = "Real Simulator";
     h["HTTP-Referer"] = "http://localhost:3000";
+  }
+  // OpenCode Go/Zen: без стабильного x-opencode-session запросы отклоняются
+  // (сентябрь 2026). Фолбэк-идентификатор лучше, чем ничего.
+  if (p.kind === "opencode") {
+    h["x-opencode-session"] = sessionId ?? "real-simulator";
   }
   return h;
 }
@@ -107,8 +120,7 @@ export async function fetchProviderModels(p: Provider, timeoutMs = 15000): Promi
   const res = await fetch(`${endpointUrl(p)}/models`, {
     headers: authHeaders(p),
     signal: AbortSignal.timeout(timeoutMs),
-  });
-  const text = await res.text();
+  });  const text = await res.text();
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${text.slice(0, 300)}`);
   const data = JSON.parse(text) as { data?: { id?: string }[] };
   return (data.data ?? [])
@@ -155,7 +167,7 @@ export async function chatCompletion(opts: ChatOptions): Promise<CompletionResul
 
   const res = await fetch(`${endpointUrl(opts.provider)}/chat/completions`, {
     method: "POST",
-    headers: authHeaders(opts.provider),
+    headers: authHeaders(opts.provider, opts.sessionId),
     body: JSON.stringify(body),
     signal: opts.signal,
   });

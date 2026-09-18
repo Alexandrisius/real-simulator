@@ -1,6 +1,6 @@
 "use client";
 
-import { use, useCallback, useEffect, useMemo, useState } from "react";
+import { use, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { ArrowLeft, Plus, RefreshCw, Shield, Shirt, Trash2 } from "lucide-react";
 import {
@@ -361,6 +361,11 @@ export default function CharacterEditorPage({
   const [loaded, setLoaded] = useState(false);
   const [wardrobe, setWardrobe] = useState<WardrobeView>({ owned: [], slots: [] });
   const [wardrobeBusy, setWardrobeBusy] = useState(false);
+  // Опорный state персонажа на момент загрузки страницы (и после каждой
+  // синхронизации с сервером). «Сохранить» шлёт ТОЛЬКО отличия от опоры —
+  // иначе устаревшие ключи (деньги, потраченные сценой; одежда из карточки
+  // гардероба) молча откатывали бы сервер к моменту открытия редактора.
+  const baselineRef = useRef<Record<string, unknown> | null>(null);
 
   const loadMeta = useCallback(() => {
     Promise.all([
@@ -392,6 +397,7 @@ export default function CharacterEditorPage({
     }
     api<Character>(`/api/characters/${numericId}`)
       .then((c) => {
+        baselineRef.current = c.state;
         setForm({
           name: c.name,
           emoji: c.emoji,
@@ -469,8 +475,35 @@ export default function CharacterEditorPage({
     }
   }, [form.fallbackProviderId, loadFbModels]);
 
+  // Разница формы с опорным state: только то, что пользователь реально менял
+  // в этом визите редактора (значение или удаление ключа). null = нет правок
+  // (или невалидный JSON — тогда state не шлём вовсе, ошибку покажет save()).
+  const userStateDiff = (): Record<string, unknown> | null => {
+    let cur: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(form.stateText || "{}");
+      if (!parsed || typeof parsed !== "object") return null;
+      cur = parsed as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+    const base = baselineRef.current ?? {};
+    const diff: Record<string, unknown> = {};
+    const keys = new Set([...Object.keys(base), ...Object.keys(cur)]);
+    for (const k of keys) {
+      const removedHere = k in base && !(k in cur);
+      const addedHere = !(k in base) && k in cur;
+      if (removedHere) diff[k] = null;
+      else if (addedHere || JSON.stringify(base[k]) !== JSON.stringify(cur[k])) diff[k] = cur[k];
+    }
+    return Object.keys(diff).length > 0 ? diff : null;
+  };
+
   // Гардероб: надеть/снять. Сервер при «надеть» сам выдаёт владение предметом
   // и возвращает свежий вид гардероба — он же и переполучение после мутации.
+  // State на сервере тоже изменился (worn_*, эффекты) — подтягиваем его в
+  // форму, поверх накатывая несохранённые правки пользователя, и двигаем
+  // опору: иначе следующее «Сохранить» откатит переодевание.
   const applyWardrobe = async (garmentId: number, action: "wear" | "remove") => {
     setError("");
     setWardrobeBusy(true);
@@ -480,6 +513,21 @@ export default function CharacterEditorPage({
         action,
       });
       setWardrobe(r);
+      // Сначала фиксируем несохранённые правки формы против СТАРОЙ опоры,
+      // и только потом двигаем опору на свежий state — иначе само переодевание
+      // (его нет в старой опоре) попало бы в диф как «правка наоборот»
+      // и следующий «Сохранить» вернул бы снятое обратно.
+      const diff = userStateDiff();
+      const fresh = await api<Character>(`/api/characters/${numericId}`);
+      baselineRef.current = fresh.state;
+      const next = { ...fresh.state };
+      if (diff) {
+        for (const [k, v] of Object.entries(diff)) {
+          if (v === null) delete next[k];
+          else next[k] = v;
+        }
+      }
+      setForm((f) => ({ ...f, stateText: JSON.stringify(next, null, 2) }));
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -545,11 +593,16 @@ export default function CharacterEditorPage({
     }
     let state: Record<string, unknown>;
     try {
-      state = JSON.parse(form.stateText || "{}");
+      const parsed = JSON.parse(form.stateText || "{}");
+      if (!parsed || typeof parsed !== "object") throw new Error("no");
+      state = parsed;
     } catch {
       setError("Состояние (JSON) невалидно");
       return;
     }
+    // Существующему персонажу шлём только отличия от опорного state: сервер
+    // с момента открытия редактора мог поменять другие ключи (сцена потратила
+    // деньги, карточка гардероба переодела) — их откатывать нельзя.
     const body = {
       name: form.name,
       emoji: form.emoji || "🙂",
@@ -561,7 +614,7 @@ export default function CharacterEditorPage({
       temperature: form.temperature,
       maxTokens: form.maxTokens,
       toolIds: form.toolIds,
-      state,
+      state: isNew ? state : (userStateDiff() ?? undefined),
       isHuman: form.isHuman,
       income: form.income,
       boundaries: form.boundaries,
@@ -572,6 +625,7 @@ export default function CharacterEditorPage({
         await apiPost("/api/characters", body);
       } else {
         await apiPatch(`/api/characters/${numericId}`, body);
+        baselineRef.current = state;
       }
       router.push("/characters");
     } catch (e) {

@@ -712,6 +712,8 @@ export class Engine {
             temperature: character.temperature,
             maxTokens: character.maxTokens,
             signal: AbortSignal.any([run.abort.signal, AbortSignal.timeout(MODEL_TIMEOUT_MS)]),
+            // Стабильная «беседа» для гейтвея OpenCode (x-opencode-session).
+            sessionId: `char-${character.id}`,
             mockContext: {
               actor: character.name,
               others: participants.filter((p) => p.id !== character.id).map((p) => p.name),
@@ -947,6 +949,7 @@ export class Engine {
               outcome: ex.outcome?.outcomeId,
               targetId: ex.targetId,
               offered: ex.offered || undefined,
+              offerId: ex.offered ? ex.offerId : undefined,
             };
             stateChanges.push(...ex.stateChanges);
             // Комбо: точная последовательность успешных действий может дать
@@ -1588,6 +1591,7 @@ export class Engine {
           outcome: ex.outcome?.outcomeId,
           targetId: ex.targetId,
           offered: ex.offered || undefined,
+          offerId: ex.offered ? ex.offerId : undefined,
         },
       ],
       stateChanges: ex.stateChanges.length > 0 ? ex.stateChanges : undefined,

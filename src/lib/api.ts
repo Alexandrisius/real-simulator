@@ -7,7 +7,7 @@ import { toolDraftPatchSchema } from "./toolRequests";
 
 export const providerSchema = z.object({
   name: z.string().min(1, "Название обязательно"),
-  kind: z.enum(["lmstudio", "openrouter", "openai-compatible", "mock"]),
+  kind: z.enum(["lmstudio", "openrouter", "opencode", "openai-compatible", "mock"]),
   baseUrl: z.string().min(1, "URL обязателен"),
   apiKey: z.string().optional().default(""),
 });

@@ -341,10 +341,22 @@ before touching the engine, prompt assembly, or scoring.
 - API routes validate input with zod schemas from `src/lib/api.ts`; client code
   goes through `api()` in `src/components/api.ts`. `PATCH /api/characters/:id`
   with `state` MERGES by key (a full replace would wipe engine changes made
-  since the editor page was opened); `null` value deletes the key, and new/
-  deleted keys are mirrored into `scene_characters.initial_state` snapshots so
-  editor edits survive scene «Заново» (existing snapshot values are untouched —
-  replay must still revert scene progress).
+  since the editor page was opened); `null` value deletes the key, and edits
+  are mirrored two ways so they survive scene «Заново»: new/deleted keys go
+  into `scene_characters.initial_state` snapshots (existing snapshot values
+  untouched — replay must still revert scene progress), while ALL edited
+  keys/values land in `scene_characters.editor_overlay`
+  (`overlayEditorState`), which `resetSceneFull` re-applies on top of the
+  restored snapshot — explicit Architect edits (money, static traits) are
+  never reverted by «Заново», only scene progress is. The editor wardrobe
+  endpoint (`POST /api/characters/:id/wardrobe`) records its state delta
+  through `recordWardrobeEdit` (mirror + overlay) — clothing configured in
+  the editor survives «Заново» too, while agents undressing each other
+  inside a scene reverts with the snapshot. The editor page itself
+  sends ONLY the diff vs its load-time baseline (stale keys would silently
+  revert server-side changes: money spent by a scene, wardrobe-card dressing);
+  the wardrobe card re-syncs the form state after wear/remove, re-applying
+  the user's unsaved edits on top.
 - Budget/spam guards live in the engine: per-scene API-call and token limits,
   anti-repeat (3 identical tool calls → pause), 5 consecutive failed turns →
   pause, 3-minute per-turn timeout. Keep them intact. Flow runs go through

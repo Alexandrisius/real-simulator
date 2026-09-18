@@ -1136,7 +1136,7 @@ async function main() {
       observationTemplate: "{name} обнимает {who}",
       effects: [{ target: "tool_target", key: "mood", op: "add", value: 1 }],
     });
-    updChar2(dima.id, { toolIds: [kiss.id, sex.id], state: { money: 100, mood: 3, penis: 15 } });
+    updChar2(dima.id, { toolIds: [kiss.id, sex.id], state: { money: 100, mood: 3, endurance: 15 } });
     updChar2(yana.id, {
       state: { height: 172, tattoo: "роза", money: 10, energy: 3, mood: 5 },
       boundaries: [
@@ -1152,7 +1152,7 @@ async function main() {
         {
           toolName: "try_sex",
           minRelation: null, minMood: null, requirePlace: "дом",
-          requireAttr: { owner: "actor", key: "penis", op: ">=", value: 18 },
+          requireAttr: { owner: "actor", key: "endurance", op: ">=", value: 18 },
           refusalText: "резко останавливает: не здесь и не так",
           effects: [{ target: "relation", key: "relation", op: "add", value: -2 }],
         },
@@ -1198,20 +1198,20 @@ async function main() {
     const streetSex = engine.act(boundScene.id, dima.id, "try_sex", { who: "Яна" });
     assert(!streetSex.ok && streetSex.result.includes("не здесь"), "на улице близость отклонена (место)");
 
-    // 4. В доме, но физика не проходит (penis 15 < 18) — отказ всегда
+    // 4. В доме, но физика не проходит (endurance 15 < 18) — отказ всегда
     updScene(boundScene.id, { config: { place: "дом" } });
     const homeSex = engine.act(boundScene.id, dima.id, "try_sex", { who: "Яна" });
-    assert(!homeSex.ok && homeSex.result.includes("penis"), "дома близость отклонена физикой (15 < 18)");
+    assert(!homeSex.ok && homeSex.result.includes("endurance"), "дома близость отклонена физикой (15 < 18)");
 
     // 5. Физика проходит — успех
-    updChar2(dima.id, { state: { money: 95, mood: 3, penis: 18 } });
+    updChar2(dima.id, { state: { money: 95, mood: 3, endurance: 18 } });
     const okSex = engine.act(boundScene.id, dima.id, "try_sex", { who: "Яна" });
-    assert(okSex.ok, "при penis=18 и месте «дом» близость проходит");
+    assert(okSex.ok, "при endurance=18 и месте «дом» близость проходит");
 
     // 5b. Исходящее правило (scope: outgoing): сам актёр не делает этого
     // с теми, кто не подходит, — даже когда границ цели пройдены.
     updChar2(dima.id, {
-      state: { money: 95, mood: 3, penis: 18 },
+      state: { money: 95, mood: 3, endurance: 18 },
       boundaries: [
         {
           toolName: "try_sex",
@@ -1241,7 +1241,7 @@ async function main() {
       if (sc.status === "running") await engine.control(sc.id, "stop");
     }
     setRelation(yana.id, dima.id, 0);
-    updChar2(dima.id, { toolIds: [kiss.id], state: { money: 95, mood: 3, penis: 18 } });
+    updChar2(dima.id, { toolIds: [kiss.id], state: { money: 95, mood: 3, endurance: 18 } });
     // Яна — человек: остаётся участником (цель), но движок не играет за неё,
     // поэтому вся очередь скрипта достаётся Диме.
     updChar2(yana.id, { isHuman: true });
@@ -1287,7 +1287,7 @@ async function main() {
     });
 
     // Дубль: content == text аргумента send_message
-    updChar2(dima.id, { toolIds: [msgTool.id], state: { money: 95, mood: 3, penis: 18 } });
+    updChar2(dima.id, { toolIds: [msgTool.id], state: { money: 95, mood: 3, endurance: 18 } });
     setMockScript([{ name: "send_message", args: { to: "Яна", text: longText }, content: longText }]);
     await engine.control(dupScene.id, "start");
     const dupDeadline = Date.now() + 10000;
@@ -1437,8 +1437,8 @@ async function main() {
     const { REVEAL_TOOL_NAME } = await import("../src/lib/types");
 
     // Скрытая характеристика Димы
-    attr("penis", "Достоинство", { emoji: "🍆", visibility: "hidden", liePenalty: 2, coveredBy: [] });
-    updChar2(dima.id, { state: { money: 95, mood: 3, penis: 15 } });
+    attr("endurance", "Выносливость", { emoji: "🏃", visibility: "hidden", liePenalty: 2, coveredBy: [] });
+    updChar2(dima.id, { state: { money: 95, mood: 3, endurance: 15 } });
     assert(hasHiddenAttributes(), "в мире есть скрытые характеристики (reveal доступен)");
 
     const knowScene = createScene({
@@ -1458,17 +1458,17 @@ async function main() {
       attributeDefs: listAttributes(),
       knowledge: knowledgeOf(yana.id),
     });
-    assert(!yanaBefore.includes("penis"), "до заявления скрытая характеристика не существует для наблюдателя");
+    assert(!yanaBefore.includes("endurance"), "до заявления скрытая характеристика не существует для наблюдателя");
 
     // Дима заявляет 20 (истина 15) — лично Яне
     const claim = engine.act(knowScene.id, dima.id, REVEAL_TOOL_NAME, {
-      attribute: "penis",
+      attribute: "endurance",
       value: 20,
       to: "Яна",
     });
     assert(claim.ok, "reveal_attribute работает через единый путь act");
     const kn = knowledgeAbout(yana.id, dima.id);
-    assert(kn.some((k) => k.key === "penis" && k.status === "claimed" && k.value === "20"), "заявление записано как claimed");
+    assert(kn.some((k) => k.key === "endurance" && k.status === "claimed" && k.value === "20"), "заявление записано как claimed");
     const claimEvent = listSceneEvents(knowScene.id).find(
       (e) => e.type === "action" && (e.payload.calls ?? [])[0]?.toolName === REVEAL_TOOL_NAME
     );
@@ -1497,7 +1497,7 @@ async function main() {
       turn: 1,
       observer: getCharacter(yana.id)!,
       subject: getCharacter(dima.id)!,
-      key: "penis",
+      key: "endurance",
       trueValue: 15,
     });
     assert(!!exposure && exposure.includes("ложь"), "разоблачение возвращает текст события");
@@ -1511,7 +1511,7 @@ async function main() {
       "наблюдателю лично пришло событие разоблачения"
     );
     const kn2 = knowledgeAbout(yana.id, dima.id);
-    assert(kn2.some((k) => k.key === "penis" && k.status === "verified" && k.value === "15"), "запись стала verified с истиной");
+    assert(kn2.some((k) => k.key === "endurance" && k.status === "verified" && k.value === "15"), "запись стала verified с истиной");
 
     const yanaVerified = buildSystemPrompt({
       character: getCharacter(yana.id)!,
@@ -1530,7 +1530,7 @@ async function main() {
       turn: 2,
       observer: getCharacter(yana.id)!,
       subject: getCharacter(dima.id)!,
-      key: "penis",
+      key: "endurance",
       trueValue: 15,
     });
     assert(again === null, "повторный verify не дублирует разоблачение");
@@ -1556,18 +1556,18 @@ async function main() {
     createClothingSlot({ slot: "underwear", layer: 2, undressPlaces: ["дом", "отель", "пляж"], position: 3 });
     assert(listClothingSlots().length === 3, "слоты одежды создаются");
 
-    // penis теперь прикрыт бельём
+    // endurance теперь прикрыт бельём
     const { updateAttribute: updAttr } = await import("../src/db/queries");
-    const penisDef = listAttributes().find((a) => a.key === "penis")!;
-    updAttr(penisDef.id, {
-      key: "penis", label: penisDef.label, emoji: penisDef.emoji, type: penisDef.type,
-      unit: penisDef.unit, min: penisDef.min, max: penisDef.max, options: penisDef.options,
-      position: penisDef.position, visibility: "hidden", liePenalty: 2, coveredBy: ["underwear"],
+    const enduranceDef = listAttributes().find((a) => a.key === "endurance")!;
+    updAttr(enduranceDef.id, {
+      key: "endurance", label: enduranceDef.label, emoji: enduranceDef.emoji, type: enduranceDef.type,
+      unit: enduranceDef.unit, min: enduranceDef.min, max: enduranceDef.max, options: enduranceDef.options,
+      position: enduranceDef.position, visibility: "hidden", liePenalty: 2, coveredBy: ["underwear"],
     });
 
     updC(dima.id, {
       state: {
-        money: 95, mood: 3, penis: 15,
+        money: 95, mood: 3, endurance: 15,
         worn_top: "Куртка", worn_bottom: "Джинсы", worn_underwear: "Трусы",
       },
     });
@@ -1607,14 +1607,14 @@ async function main() {
     assert(bottom.ok, "штаны снимаются после верхнего");
 
     // Новая ложь перед обнажением (заявление уже было разоблачено — заявим снова)
-    engine.act(clothScene.id, dima.id, "reveal_attribute", { attribute: "penis", value: 20, to: "Яна" });
-    assert(knowledgeAbout(yana.id, dima.id).some((k) => k.key === "penis" && k.status === "claimed"), "новое заявление вернуло статус claimed");
+    engine.act(clothScene.id, dima.id, "reveal_attribute", { attribute: "endurance", value: 20, to: "Яна" });
+    assert(knowledgeAbout(yana.id, dima.id).some((k) => k.key === "endurance" && k.status === "claimed"), "новое заявление вернуло статус claimed");
     const relBefore = getRelation(yana.id, dima.id);
 
     const uw = engine.act(clothScene.id, dima.id, UNDRESS_TOOL_NAME, { slot: "underwear" });
     assert(uw.ok, "бельё снимается после верхнего");
     assert(uw.result.includes("видят") || uw.result.includes("видит"), "ответ модели упоминает открывшееся");
-    const knUw = knowledgeAbout(yana.id, dima.id).find((k) => k.key === "penis");
+    const knUw = knowledgeAbout(yana.id, dima.id).find((k) => k.key === "endurance");
     assert(knUw?.status === "verified" && knUw.value === "15", "обнажение верифицировало скрытую характеристику");
     assert(
       listSceneEvents(clothScene.id).some(
@@ -1627,7 +1627,7 @@ async function main() {
     // wear возвращает предмет; verified-память остаётся
     const wear = engine.act(clothScene.id, dima.id, WEAR_TOOL_NAME, { slot: "underwear" });
     assert(wear.ok && (getCharacter(dima.id)!.state.worn_underwear as string) === "Трусы", "wear возвращает снятое");
-    assert(knowledgeAbout(yana.id, dima.id).some((k) => k.key === "penis" && k.status === "verified"), "память (verified) не забывается при одевании");
+    assert(knowledgeAbout(yana.id, dima.id).some((k) => k.key === "endurance" && k.status === "verified"), "память (verified) не забывается при одевании");
 
     // Промпт: раздел правил одежды и личное знание
     const yanaClothPrompt = buildSystemPrompt({
@@ -2052,7 +2052,7 @@ async function main() {
     });
     setRelation(yana.id, dima.id, 7);
     setRelation(dima.id, yana.id, 5);
-    upsertClaim({ observerId: yana.id, subjectId: dima.id, key: "penis", value: 25 });
+    upsertClaim({ observerId: yana.id, subjectId: dima.id, key: "endurance", value: 25 });
     const snapshotMood = getCharacter(dima.id)!.state.mood as number; // снимок рассадки
     updChar(dima.id, { state: { mood: snapshotMood + 5, energy: 1, money: 5 } }); // съехавшее состояние
     resetSceneFull(rsScene.id);
@@ -3750,6 +3750,97 @@ async function main() {
       `причина называет условие об одежде (получено: ${r5.result.slice(0, 120)})`
     );
     assert((getCharacter(oskar.id)!.state.money as number) === 35, "повторный отказ — деньги не тронуты");
+  }
+
+  // --- Оверлей правок редактора: «Заново» откатывает прогресс сцены,
+  // но не явные правки Архитектора (деньги/черты, заданные после рассадки) ---
+  {
+    const {
+      updateCharacter,
+      createScene,
+      resetSceneFull,
+      overlayEditorState,
+      setSceneParticipants,
+    } = await import("../src/db/queries");
+    const editorChar = createCharacter({
+      name: "Эдитор",
+      emoji: "🧪",
+      persona: "тест правок редактора",
+      providerId: provider.id,
+      model: "mock",
+      temperature: 0.7,
+      maxTokens: 800,
+      toolIds: [],
+      state: { money: 100, endurance: 15, mood: 5, tattoo: 1 },
+      isHuman: false,
+      income: 0,
+    });
+    const editorScene = createScene({
+      name: "Сцена оверлея",
+      setting: "тест",
+      config: { turnDelayMs: 0, maxTurns: 1, maxIterPerTurn: 1 },
+      characterIds: [editorChar.id],
+    });
+    // Сцена «сыграла»: потратила деньги, поменяла настроение
+    updateCharacter(editorChar.id, { state: { money: 80, endurance: 15, mood: 8, tattoo: 1 } });
+    // Правки редактора после рассадки: endurance 15→14, money→10000, tattoo удалён
+    const edited = new Map<string, unknown | null>([
+      ["endurance", 14],
+      ["money", 10000],
+      ["tattoo", null],
+    ]);
+    const cur = getCharacter(editorChar.id)!.state;
+    const merged: Record<string, unknown> = { ...cur, endurance: 14, money: 10000 };
+    delete merged.tattoo;
+    updateCharacter(editorChar.id, { state: merged });
+    overlayEditorState(editorChar.id, edited);
+
+    resetSceneFull(editorScene.id);
+    const st = getCharacter(editorChar.id)!.state;
+    assert(
+      (st.money as number) === 10000,
+      `«Заново»: правка денег пережила откат (money=${st.money})`
+    );
+    assert(
+      (st.endurance as number) === 14,
+      `«Заново»: правка черты пережила откат (endurance=${st.endurance})`
+    );
+    assert((st.mood as number) === 5, `«Заново»: прогресс сцены откатился (mood=${st.mood}, ждали 5)`);
+    assert(st.tattoo === undefined, "«Заново»: ключ, удалённый редактором, не воскрес");
+
+    // Гардероб редактора — та же правка Архитектора: переодел персонажа
+    // в карточке → конфигурация одежды переживает «Заново»
+    const { createGarment, recordWardrobeEdit } = await import("../src/db/queries");
+    const { dressCharacter } = await import("../src/lib/wardrobe");
+    const shirt = createGarment({
+      name: "Рубашка Эдитора",
+      emoji: "👔",
+      description: "",
+      slot: "top",
+      effects: [],
+      price: 0,
+    });
+    const beforeDress = getCharacter(editorChar.id)!.state;
+    const dressRes = dressCharacter(editorChar.id, shirt.id);
+    assert(dressRes.ok, `редактор: надели рубашку (${dressRes.message})`);
+    const afterDress = getCharacter(editorChar.id)!.state;
+    recordWardrobeEdit(editorChar.id, beforeDress, afterDress);
+    // «Сцена раздела его»: прямой правкой state имитируем прогресс
+    updateCharacter(editorChar.id, { state: { ...afterDress, worn_top: "" } });
+    resetSceneFull(editorScene.id);
+    assert(
+      (getCharacter(editorChar.id)!.state.worn_top as string) === "Рубашка Эдитора",
+      "«Заново»: одежда из карточки гардероба пережила откат"
+    );
+
+    // Пересадка состава: снимок переснимается с текущего state, оверлей чист
+    setSceneParticipants(editorScene.id, [editorChar.id]);
+    const row = db
+      .prepare("SELECT initial_state, editor_overlay FROM scene_characters WHERE scene_id = ?")
+      .get(editorScene.id) as unknown as { initial_state: string; editor_overlay: string | null };
+    const snap = JSON.parse(row.initial_state);
+    assert(snap.money === 10000 && snap.endurance === 14, "пересадка состава снимает свежий state");
+    assert(!row.editor_overlay || row.editor_overlay === "{}", "пересадка состава чистит оверлей");
   }
 
   console.log("\nE2E: все проверки пройдены ✅");

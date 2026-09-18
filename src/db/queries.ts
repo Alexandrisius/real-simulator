@@ -1443,6 +1443,61 @@ export function characterInScenes(id: number): number {
   return Number(row.n);
 }
 
+/**
+ * Оверлей правок редактора: помнит, какие ключи state и в какие значения
+ * Архитектор явно выставил у персонажа ПОСЛЕ рассадки по сценам. «Заново»
+ * (resetSceneFull) восстанавливает снимок сцены, а затем накатывает оверлей —
+ * так правки редактора (деньги, статичные черты) переживают откат прогресса,
+ * а прогресс сцены (траты, эффекты) честно откатывается. null в оверлее —
+ * ключ удалён редактором.
+ */
+export function overlayEditorState(
+  characterId: number,
+  keys: Map<string, unknown | null>
+): void {
+  if (keys.size === 0) return;
+  const db = getDb();
+  const rows = db
+    .prepare("SELECT scene_id, editor_overlay FROM scene_characters WHERE character_id = ?")
+    .all(characterId) as unknown as { scene_id: number; editor_overlay: string | null }[];
+  const upd = db.prepare(
+    "UPDATE scene_characters SET editor_overlay = ? WHERE scene_id = ? AND character_id = ?"
+  );
+  for (const r of rows) {
+    const overlay = parseJson<Record<string, unknown | null>>(r.editor_overlay, {});
+    for (const [k, v] of keys) {
+      // null — редактор УДАЛИЛ ключ: помним это как null в оверлее,
+      // чтобы «Заново» вычистил ключ и из снимка (а не воскресил его).
+      overlay[k] = v;
+    }
+    upd.run(JSON.stringify(overlay), r.scene_id, characterId);
+  }
+}
+
+/**
+ * Дельта-правки из карточки гардероба редактора: всё, что изменилось в state
+ * надеванием/снятием (ключи слотов и эффекты предметов), запоминается как
+ * правки Архитектора (зеркало + оверлей). Тогда «Заново» откатывает прогресс
+ * сцены, но конфигурация одежды, выставленная в редакторе, сохраняется.
+ */
+export function recordWardrobeEdit(
+  characterId: number,
+  before: Record<string, unknown>,
+  after: Record<string, unknown>
+): void {
+  const keys = new Set([...Object.keys(before), ...Object.keys(after)]);
+  const edited = new Map<string, unknown | null>();
+  for (const k of keys) {
+    const removed = k in before && !(k in after);
+    const added = !(k in before) && k in after;
+    if (removed) edited.set(k, null);
+    else if (added || JSON.stringify(before[k]) !== JSON.stringify(after[k])) edited.set(k, after[k]);
+  }
+  if (edited.size === 0) return;
+  mirrorStateKeysToSceneSnapshots(characterId, edited);
+  overlayEditorState(characterId, edited);
+}
+
 // ---------- Scenes ----------
 
 interface SceneRow {
@@ -1632,17 +1687,23 @@ export function deleteRelation(fromId: number, toId: number): void {
 /**
  * «Заново»: полный откат диалога в сцене. События стираются; отношения между
  * участниками и взаимная память (заявления, проверки) обнуляются; состояния
- * участников возвращаются к снимку на момент рассадки. Если снимка ещё нет
- * (старая сцена) — текущее состояние запоминается как исходное.
+ * участников возвращаются к снимку на момент рассадки, поверх которого
+ * накатывается оверлей правок редактора (деньги/черты, заданные после
+ * рассадки, переживают откат прогресса). Если снимка ещё нет (старая сцена) —
+ * текущее состояние запоминается как исходное.
  */
 export function resetSceneFull(id: number): void {
   const db = getDb();
   const participants = getSceneParticipants(id);
   const rows = db
     .prepare(
-      "SELECT character_id, initial_state FROM scene_characters WHERE scene_id = ?"
+      "SELECT character_id, initial_state, editor_overlay FROM scene_characters WHERE scene_id = ?"
     )
-    .all(id) as unknown as { character_id: number | bigint; initial_state: string | null }[];
+    .all(id) as unknown as {
+    character_id: number | bigint;
+    initial_state: string | null;
+    editor_overlay: string | null;
+  }[];
 
   const updSnapshot = db.prepare(
     "UPDATE scene_characters SET initial_state = ? WHERE scene_id = ? AND character_id = ?"
@@ -1657,7 +1718,12 @@ export function resetSceneFull(id: number): void {
       updSnapshot.run(snapshot, id, cid);
     }
     const state = parseJson<Record<string, unknown>>(snapshot, {});
-    if (Object.keys(state).length > 0) updateCharacter(cid, { state });
+    // Оверлей правок редактора поверх снимка: то, что Архитектор явно
+    // выставил после рассадки, «Заново» не откатывает.
+    const overlay = parseJson<Record<string, unknown | null>>(r.editor_overlay, {});
+    const merged = { ...state, ...overlay };
+    for (const [k, v] of Object.entries(overlay)) if (v === null) delete merged[k];
+    if (Object.keys(merged).length > 0) updateCharacter(cid, { state: merged });
   }
 
   // Отношения внутри сцены — в ноль (записи удаляются)

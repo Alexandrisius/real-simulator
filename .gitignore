@@ -8,3 +8,5 @@ release/
 .env.local
 tsconfig.tsbuildinfo
 next-env.d.ts
+.release-cache/
+dist/
