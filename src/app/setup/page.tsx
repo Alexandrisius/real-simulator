@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Link from "next/link";
 import { Bot, Loader2, RefreshCw, Send, Sparkles, User } from "lucide-react";
-import { Badge, Btn, Card, ErrorText, Field, IconBtn, Input, PageHeader } from "@/components/ui";
+import { Badge, Btn, Card, ErrorText, Field, Input, PageHeader } from "@/components/ui";
 import { Dropdown } from "@/components/Dropdown";
 import { Combobox } from "@/components/Combobox";
 import { api, apiPost } from "@/components/api";
@@ -132,7 +132,7 @@ export default function SetupAssistantPage() {
           <div className="min-w-56">
             <Field
               label="Провайдер ассистента"
-              hint="Через него работает ассистент; его модель достаётся новым персонажам"
+              hint="его модель достаётся новым персонажам"
             >
               <Dropdown
                 value={String(cfg?.providerId ?? "")}
@@ -156,10 +156,7 @@ export default function SetupAssistantPage() {
             </Field>
           </div>
           <div className="min-w-64 flex-1">
-            <Field
-              label="Модель"
-              hint={modelsError || "Выберите из списка провайдера (⟳ — обновить) или введите вручную"}
-            >
+            <Field label="Модель" hint={modelsError || "⟳ — обновить список моделей"}>
               <div className="flex gap-2">
                 <Combobox
                   value={modelDraft}
@@ -171,15 +168,16 @@ export default function SetupAssistantPage() {
                   options={models}
                   placeholder="имя модели, напр. glm-5.3-flash"
                   className="min-w-0 flex-1"
-                  inputClassName="font-mono text-xs"
+                  inputClassName="h-9 py-0 font-mono text-xs"
                 />
-                <IconBtn
-                  label="Обновить список моделей"
-                  loading={loadingModels}
+                <Btn
                   onClick={() => cfg?.providerId && loadModels(cfg.providerId)}
+                  loading={loadingModels}
+                  title="Обновить список моделей"
+                  className="px-3"
                 >
                   {!loadingModels && <RefreshCw className="h-[18px] w-[18px]" />}
-                </IconBtn>
+                </Btn>
                 <Btn variant="primary" onClick={() => saveCfg()}>
                   Сохранить
                 </Btn>
