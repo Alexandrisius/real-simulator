@@ -50,9 +50,11 @@ export default function SetupAssistantPage() {
     setLoadingModels(true);
     setModelsError("");
     try {
-      const r = await api<string[]>(`/api/providers/${providerId}/models`);
-      setModels(r);
-      if (r.length === 0) setModelsError("Список пуст — сервер не отдаёт модели, введите имя вручную");
+      // Эндпоинт отдаёт { models: string[] } — как в редакторе персонажа
+      const r = await api<{ models: string[] }>(`/api/providers/${providerId}/models`);
+      const list = Array.isArray(r.models) ? r.models : [];
+      setModels(list);
+      if (list.length === 0) setModelsError("Список пуст — сервер не отдаёт модели, введите имя вручную");
     } catch (e) {
       setModels([]);
       setModelsError(`${e instanceof Error ? e.message : String(e)} — можно ввести имя модели вручную`);
